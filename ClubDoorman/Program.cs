@@ -17,8 +17,13 @@ public class Program
                     config
                         .MinimumLevel.Debug()
                         .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
+                        .MinimumLevel.Override("Microsoft.EntityFrameworkCore.Database", LogEventLevel.Warning)
                         .Enrich.FromLogContext()
-                        .WriteTo.Async(a => a.Console());
+                        .WriteTo.Async(a =>
+                            a.Console(
+                                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Scope} {Message:lj}{NewLine}{Exception}"
+                            )
+                        );
                 }
             )
             .ConfigureServices(services =>

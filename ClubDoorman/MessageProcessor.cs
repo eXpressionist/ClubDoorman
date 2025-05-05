@@ -50,6 +50,7 @@ internal class MessageProcessor
 
     public async Task HandleUpdate(Update update, CancellationToken stoppingToken)
     {
+        using var logScope = _logger.BeginScope("Update Id = {Id}", update.Id);
         // TODO: this is not ideal, share getter with AdminCommandHandler
         _me ??= await _bot.GetMe(cancellationToken: stoppingToken);
         if (update.MessageReaction != null)
@@ -429,10 +430,11 @@ internal class MessageProcessor
                 if (chatMember.OldChatMember.Status == ChatMemberStatus.Left)
                 {
                     _logger.LogDebug(
-                        "New chat member in chat {Chat}: {First} {Last}; Id = {Id}",
+                        "New chat member in chat {Chat}: {First} {Last} @{Username}; Id = {Id}",
                         chatMember.Chat.Title,
                         newChatMember.User.FirstName,
                         newChatMember.User.LastName,
+                        newChatMember.User.Username,
                         newChatMember.User.Id
                     );
                     await _captchaManager.IntroFlow(null, newChatMember.User, chatMember.Chat);
