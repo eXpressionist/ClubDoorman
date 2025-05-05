@@ -128,7 +128,7 @@ internal class CaptchaManager
             return;
         }
 
-        const int challengeLength = 8;
+        const int challengeLength = 6;
         var correctAnswerIndex = Random.Shared.Next(challengeLength);
         var challenge = new List<int>(challengeLength);
         while (challenge.Count < challengeLength)
@@ -154,7 +154,7 @@ internal class CaptchaManager
 
         var del = await _bot.SendMessage(
             chatId,
-            $"Привет, [{Escape(fullName)}](tg://user?id={user.Id})! Антиспам: на какой кнопке {Captcha.CaptchaList[correctAnswer].Description}?",
+            $"Привет, [{Escape(fullName)}](tg://user?id={user.Id})! Реши капчу или бот тебя кикнет: нажми кнопку с эмодзи .. \n(Solve the captcha or bot will kick you, pick a button with ..) \n -> {Captcha.CaptchaList[correctAnswer].Description} <-",
             parseMode: ParseMode.Markdown,
             replyParameters: replyParams,
             replyMarkup: new InlineKeyboardMarkup(keyboard)
