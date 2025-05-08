@@ -182,7 +182,7 @@ internal class MessageProcessor
             _logger.LogDebug("InBanlist");
             if (Config.BlacklistAutoBan)
             {
-                var stats = _statistics.Stats.GetOrAdd(chat.Id, new Stats(chat.Title));
+                var stats = _statistics.Stats.GetOrAdd(chat.Id, new Stats(chat.Title) { Id = chat.Id });
                 stats.BlacklistBanned++;
                 await _bot.BanChatMember(chat.Id, user.Id, revokeMessages: false, cancellationToken: stoppingToken);
                 await _bot.DeleteMessage(chat.Id, message.MessageId, stoppingToken);
@@ -285,8 +285,8 @@ internal class MessageProcessor
             {
                 var keyboard = new List<InlineKeyboardButton>
                 {
-                    new("👍 ok") { CallbackData = $"attOk_{user.Id}" },
-                    new("🤖 ban") { CallbackData = $"ban_{message.Chat.Id}_{user.Id}" },
+                    new(Consts.BanButton) { CallbackData = $"ban_{message.Chat.Id}_{user.Id}" },
+                    new(Consts.OkButton) { CallbackData = $"attOk_{user.Id}" },
                 };
 
                 ReplyParameters? replyParams = null;
@@ -401,7 +401,7 @@ internal class MessageProcessor
         try
         {
             var chat = message.Chat;
-            var stats = _statistics.Stats.GetOrAdd(chat.Id, new Stats(chat.Title));
+            var stats = _statistics.Stats.GetOrAdd(chat.Id, new Stats(chat.Title) { Id = chat.Id });
             stats.KnownBadMessage++;
             await _bot.DeleteMessage(chat, message.MessageId, stoppingToken);
             await _bot.BanChatMember(chat.Id, user.Id, cancellationToken: stoppingToken);
@@ -469,8 +469,8 @@ internal class MessageProcessor
             $"{msg}. Сообщение НЕ удалено.{Environment.NewLine}Юзер {Utils.FullName(user)} из чата {message.Chat.Title}",
             replyParameters: forward.MessageId,
             replyMarkup: new InlineKeyboardMarkup(
-                new InlineKeyboardButton("🤖 ban") { CallbackData = callbackData },
-                new InlineKeyboardButton("👍 ok") { CallbackData = "noop" }
+                new InlineKeyboardButton(Consts.BanButton) { CallbackData = callbackData },
+                new InlineKeyboardButton(Consts.OkButton) { CallbackData = "noop" }
             ),
             cancellationToken: stoppingToken
         );
@@ -508,12 +508,12 @@ internal class MessageProcessor
         var postLink = Utils.LinkToMessage(message.Chat, message.MessageId);
         var row = new List<InlineKeyboardButton>(
             [
-                new InlineKeyboardButton("🤖 бан") { CallbackData = callbackDataBan },
-                new InlineKeyboardButton("😶 пропуск") { CallbackData = "noop" },
+                new InlineKeyboardButton(Consts.BanButton) { CallbackData = callbackDataBan },
+                new InlineKeyboardButton(Consts.OkButton) { CallbackData = "noop" },
             ]
         );
         if (Config.ApproveButtonEnabled)
-            row.Add(new InlineKeyboardButton("🥰 свой") { CallbackData = $"approve_{user.Id}" });
+            row.Add(new InlineKeyboardButton("🥰🥰🥰 approve") { CallbackData = $"approve_{user.Id}" });
 
         await _bot.SendMessage(
             admChat,
