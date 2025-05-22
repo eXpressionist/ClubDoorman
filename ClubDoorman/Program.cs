@@ -31,7 +31,10 @@ public class Program
                 .ConfigureServices(services =>
                 {
                     services.AddHostedService<Worker>();
-                    services.AddSingleton<ITelegramBotClient>(new TelegramBotClient(Config.BotApi));
+                    services.AddSingleton<Config>();
+                    services.AddSingleton<ITelegramBotClient>(provider => new TelegramBotClient(
+                        provider.GetRequiredService<Config>().BotApi
+                    ));
                     services.AddSingleton<CaptchaManager>();
                     services.AddSingleton<MessageProcessor>();
                     services.AddSingleton<StatisticsReporter>();
@@ -41,7 +44,6 @@ public class Program
                     services.AddSingleton<ReactionHandler>();
                     services.AddSingleton<BadMessageManager>();
                     services.AddSingleton<AiChecks>();
-                    //services.AddSingleton<NsfwChecks>();
                     services.AddDbContext<AppDbContext>(opts => opts.UseSqlite("Data Source=data/app.db"));
                     services.AddHybridCache();
                 })
@@ -59,6 +61,7 @@ public class Program
         {
             Console.WriteLine("Unhandled exception in Main");
             Console.WriteLine(e.Message);
+            Console.WriteLine(e.StackTrace);
         }
     }
 
