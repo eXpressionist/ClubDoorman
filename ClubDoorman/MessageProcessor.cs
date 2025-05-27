@@ -90,7 +90,12 @@ internal class MessageProcessor
         var chat = message.Chat;
         if (chat.Type == ChatType.Private)
         {
-            await _bot.SendMessage(chat, "Сорян, я не отвечаю в личке", replyParameters: message, cancellationToken: stoppingToken);
+            await _bot.SendMessage(
+                chat,
+                "Сорян, я не отвечаю в личке, если вы хотели написать создателю - в описании",
+                replyParameters: message,
+                cancellationToken: stoppingToken
+            );
             return;
         }
         if (message.NewChatMembers != null && chat.Id != _config.AdminChatId && !_config.MultiAdminChatMap.Values.Contains(chat.Id))
@@ -108,9 +113,9 @@ internal class MessageProcessor
 
         if (message.SenderChat != null)
         {
-            if (message.SenderChat.Id == chat.Id)
-                return;
             if (message.IsAutomaticForward)
+                return;
+            if (message.SenderChat.Id == chat.Id)
                 return;
             // to get linked_chat_id we need ChatFullInfo
             var chatFull = await _bot.GetChat(chat, stoppingToken);
@@ -130,25 +135,30 @@ internal class MessageProcessor
                             _logger.LogDebug("Popular channel {Ch}, not banning", message.SenderChat.Title);
                             return;
                         }
-
-                        var fwd = await _bot.ForwardMessage(admChat, chat, message.MessageId, cancellationToken: stoppingToken);
+                        Message? fwd = null;
+                        if (_config.NonFreeChat(chat.Id))
+                            fwd = await _bot.ForwardMessage(admChat, chat, message.MessageId, cancellationToken: stoppingToken);
                         await _bot.DeleteMessage(chat, message.MessageId, stoppingToken);
                         await _bot.BanChatSenderChat(chat, message.SenderChat.Id, stoppingToken);
-                        await _bot.SendMessage(
-                            admChat,
-                            $"Сообщение удалено, в чате {chat.Title} забанен канал {message.SenderChat.Title}",
-                            replyParameters: fwd,
-                            cancellationToken: stoppingToken
-                        );
+                        var stats = _statistics.Stats.GetOrAdd(chat.Id, new Stats(chat.Title) { Id = chat.Id });
+                        stats.Channels++;
+                        if (_config.NonFreeChat(chat.Id))
+                            await _bot.SendMessage(
+                                admChat,
+                                $"Сообщение удалено, в чате {chat.Title} забанен канал {message.SenderChat.Title}",
+                                replyParameters: fwd!,
+                                cancellationToken: stoppingToken
+                            );
                     }
                     catch (Exception e)
                     {
                         _logger.LogWarning(e, "Unable to ban");
-                        await _bot.SendMessage(
-                            admChat,
-                            $"Не могу удалить или забанить в чате {chat.Title} сообщение от имени канала {message.SenderChat.Title}. Не хватает могущества?",
-                            cancellationToken: stoppingToken
-                        );
+                        if (_config.NonFreeChat(chat.Id))
+                            await _bot.SendMessage(
+                                admChat,
+                                $"Не могу удалить или забанить в чате {chat.Title} сообщение от имени канала {message.SenderChat.Title}. Не хватает могущества?",
+                                cancellationToken: stoppingToken
+                            );
                     }
                     return;
                 }
@@ -278,18 +288,14 @@ internal class MessageProcessor
             return;
         }
 
-        if (
-            _config.OpenRouterApi != null
-            && message.From != null
-            && (_config.MultiAdminChatMap.Count == 0 || _config.MultiAdminChatMap.ContainsKey(message.Chat.Id))
-        )
+        if (_config.OpenRouterApi != null && message.From != null && _config.NonFreeChat(message.Chat.Id))
         {
             var replyToRecentPost =
                 message.ReplyToMessage?.IsAutomaticForward == true
                 && DateTime.UtcNow - message.ReplyToMessage.Date < TimeSpan.FromMinutes(5);
-            var (attentionProb, photo, bio) = await _aiChecks.GetAttentionBaitProbability(message.From, replyToRecentPost);
-            _logger.LogDebug("GetAttentionBaitProbability, result = {Prob}", attentionProb);
-            if (attentionProb >= Consts.LlmLowProbability)
+            var (attention, photo, bio) = await _aiChecks.GetAttentionBaitProbability(message.From, replyToRecentPost);
+            _logger.LogDebug("GetAttentionBaitProbability, result = {Prob}", attention.Probability);
+            if (attention.Probability >= Consts.LlmLowProbability)
             {
                 var keyboard = new List<InlineKeyboardButton>
                 {
@@ -312,12 +318,13 @@ internal class MessageProcessor
 
                 if (replyToRecentPost)
                     _logger.LogDebug("It's a reply to recent post, high alert");
-                var delete = attentionProb >= Consts.LlmHighProbability || replyToRecentPost;
+                var delete = attention.Probability >= Consts.LlmHighProbability || replyToRecentPost;
 
                 var action = delete ? "Даём ридонли на 10 минут" : "";
+                var at = user.Username == null ? "" : $" @{user.Username} ";
                 await _bot.SendMessage(
                     admChat,
-                    $"Вероятность что это профиль бейт спаммер {attentionProb * 100}%. {action}{Environment.NewLine}Юзер {Utils.FullName(user)} из чата {chat.Title}",
+                    $"Вероятность что это профиль бейт спаммер {attention.Probability * 100}%. {action}{Environment.NewLine}{attention.Reason}{Environment.NewLine}Юзер {Utils.FullName(user)}{at} из чата {chat.Title}",
                     replyMarkup: new InlineKeyboardMarkup(keyboard),
                     replyParameters: replyParams,
                     cancellationToken: stoppingToken
@@ -336,28 +343,22 @@ internal class MessageProcessor
                 }
             }
         }
-        if (
-            _config.OpenRouterApi != null
-            && message.From != null
-            && (_config.MultiAdminChatMap.Count == 0 || _config.MultiAdminChatMap.ContainsKey(message.Chat.Id))
-        )
+        if (_config.OpenRouterApi != null && message.From != null && _config.NonFreeChat(message.Chat.Id))
         {
-            var prob = await _aiChecks.GetSpamProbability(message);
-            if (prob >= Consts.LlmLowProbability)
+            var spamCheck = await _aiChecks.GetSpamProbability(message);
+            if (spamCheck.Probability >= Consts.LlmLowProbability)
             {
-                if (prob >= Consts.LlmHighProbability)
-                    await DeleteAndReportMessage(message, $"LLM сказал что вероятность что это спам {prob}", stoppingToken);
+                var reason =
+                    $"LLM думает что это спам {spamCheck.Probability * 100}%{Environment.NewLine}{spamCheck.Reason}";
+                if (spamCheck.Probability >= Consts.LlmHighProbability)
+                    await DeleteAndReportMessage(message, reason, stoppingToken);
                 else
-                    await DontDeleteButReportMessage(message, $"LLM сказал что вероятность что это спам {prob}", stoppingToken);
+                    await DontDeleteButReportMessage(message, reason, stoppingToken);
             }
         }
 
         // else - ham
-        if (
-            score > -0.5
-            && _config.LowConfidenceHamForward
-            && (_config.MultiAdminChatMap.Count == 0 || _config.MultiAdminChatMap.ContainsKey(message.Chat.Id))
-        )
+        if (score > -0.5 && _config.LowConfidenceHamForward && _config.NonFreeChat(message.Chat.Id))
         {
             var forward = await _bot.ForwardMessage(_config.AdminChatId, chat.Id, message.MessageId, cancellationToken: stoppingToken);
             var postLink = Utils.LinkToMessage(chat, message.MessageId);
@@ -371,16 +372,19 @@ internal class MessageProcessor
         _logger.LogDebug("Classifier thinks its ham, score {Score}", score);
 
         // Now we need a mechanism for users who have been writing non-spam for some time
-        var goodInteractions = _goodUserMessages.AddOrUpdate(user.Id, 1, (_, oldValue) => oldValue + 1);
-        if (goodInteractions >= 3)
+        if (update.Message != null)
         {
-            _logger.LogInformation(
-                "User {FullName} behaved well for the last {Count} messages, approving",
-                Utils.FullName(user),
-                goodInteractions
-            );
-            await _userManager.Approve(user.Id);
-            _goodUserMessages.TryRemove(user.Id, out _);
+            var goodInteractions = _goodUserMessages.AddOrUpdate(user.Id, 1, (_, oldValue) => oldValue + 1);
+            if (goodInteractions >= 3)
+            {
+                _logger.LogInformation(
+                    "User {FullName} behaved well for the last {Count} messages, approving",
+                    Utils.FullName(user),
+                    goodInteractions
+                );
+                await _userManager.Approve(user.Id);
+                _goodUserMessages.TryRemove(user.Id, out _);
+            }
         }
     }
 
@@ -388,17 +392,20 @@ internal class MessageProcessor
     {
         var user = message.From!;
         var fullName = Utils.FullName(user);
-        _logger.LogDebug("Autoban. Chat: {Chat} {Id} User: {User}", message.Chat.Title, message.Chat.Id, fullName);
+        var chat = message.Chat;
+        _logger.LogDebug("Autoban. Chat: {Chat} {Id} User: {User}", chat.Title, chat.Id, fullName);
         var admChat = _config.AdminChatId;
-        var forward = await _bot.ForwardMessage(admChat, message.Chat.Id, message.MessageId, cancellationToken: stoppingToken);
+        var forward = await _bot.ForwardMessage(admChat, chat.Id, message.MessageId, cancellationToken: stoppingToken);
         await _bot.SendMessage(
             admChat,
-            $"Авто-бан: {reason}{Environment.NewLine}Юзер {fullName} из чата {message.Chat.Title}{Environment.NewLine}{Utils.LinkToMessage(message.Chat, message.MessageId)}",
+            $"Авто-бан: {reason}{Environment.NewLine}Юзер {fullName} из чата {chat.Title}{Environment.NewLine}{Utils.LinkToMessage(chat, message.MessageId)}",
             replyParameters: forward,
             cancellationToken: stoppingToken
         );
-        await _bot.DeleteMessage(message.Chat, message.MessageId, cancellationToken: stoppingToken);
-        await _bot.BanChatMember(message.Chat, user.Id, revokeMessages: false, cancellationToken: stoppingToken);
+        await _bot.DeleteMessage(chat, message.MessageId, cancellationToken: stoppingToken);
+        var stats = _statistics.Stats.GetOrAdd(chat.Id, new Stats(chat.Title) { Id = chat.Id });
+        stats.Autoban++;
+        await _bot.BanChatMember(chat, user.Id, revokeMessages: false, cancellationToken: stoppingToken);
     }
 
     private async Task HandleBadMessage(Message message, User user, CancellationToken stoppingToken)
@@ -446,12 +453,12 @@ internal class MessageProcessor
                 var key = $"{chatMember.Chat.Id}_{user.Id}";
                 var lastMessage = MemoryCache.Default.Get(key) as string;
                 var tailMessage = string.IsNullOrWhiteSpace(lastMessage)
-                    ? ""
-                    : $" Его/её последним сообщением было:{Environment.NewLine}{lastMessage}";
+                    ? "Если его забанили за спам, а ML не распознал спам - киньте его сообщение сюда."
+                    : $"Его/её последним сообщением было:{Environment.NewLine}{lastMessage}";
                 var mentionAt = user.Username != null ? $"@{user.Username}" : "";
                 await _bot.SendMessage(
                     _config.GetAdminChat(chatMember.Chat.Id),
-                    $"В чате {chatMember.Chat.Title} юзеру {Utils.FullName(user)} {mentionAt} дали ридонли или забанили, посмотрите в Recent actions, возможно ML пропустил спам. Если это так - кидайте его сюда.{tailMessage}"
+                    $"В чате {chatMember.Chat.Title} юзеру {Utils.FullName(user)} {mentionAt} дали ридонли или забанили. {tailMessage}"
                 );
                 break;
         }

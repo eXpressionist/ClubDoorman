@@ -23,7 +23,7 @@ internal class AiChecks
     private readonly ResiliencePipeline _retry = new ResiliencePipelineBuilder()
         .AddRetry(new RetryStrategyOptions() { Delay = TimeSpan.FromMilliseconds(50) })
         .Build();
-    const string Model = "google/gemini-2.5-flash-preview";
+    const string Model = "google/gemini-2.5-flash-preview-05-20";
     private readonly OpenAiClient? _api;
     private readonly JsonSerializerOptions jso = new() { Converters = { new JsonStringEnumConverter() } };
     private readonly ITelegramBotClient _bot;
@@ -36,21 +36,20 @@ internal class AiChecks
         MemoryCache.Default.Add(cacheKey, (double?)0.0, new CacheItemPolicy { AbsoluteExpiration = DateTimeOffset.UtcNow.AddYears(1) });
     }
 
-    public async ValueTask<(double, byte[], string)> GetAttentionBaitProbability(
+    public async ValueTask<(SpamProbability, byte[], string)> GetAttentionBaitProbability(
         Telegram.Bot.Types.User user,
         bool checkEvenIfNoBio = false
     )
     {
-        var probability = 0.0;
+        var probability = new SpamProbability();
         var nameBioUser = "";
         var pic = Array.Empty<byte>();
         if (_api == null)
             return (probability, pic, nameBioUser);
 
         var cacheKey = $"attention:{user.Id}";
-        var exists = MemoryCache.Default.Get(cacheKey) as double?;
-        if (exists.HasValue)
-            return (exists.Value, pic, nameBioUser);
+        if (MemoryCache.Default.Get(cacheKey) is SpamProbability sp)
+            return (sp, pic, nameBioUser);
 
         try
         {
@@ -143,9 +142,9 @@ internal class AiChecks
             );
             if (response.Value1 != null)
             {
-                probability = response.Value1.Probability;
-                MemoryCache.Default.Add(cacheKey, (double?)probability, new CacheItemPolicy { SlidingExpiration = TimeSpan.FromDays(3) });
-                _logger.LogInformation("LLM GetAttentionBaitProbability: {Prob}", probability);
+                probability = response.Value1;
+                MemoryCache.Default.Add(cacheKey, probability, new CacheItemPolicy { SlidingExpiration = TimeSpan.FromDays(3) });
+                _logger.LogInformation("LLM GetAttentionBaitProbability: {@Prob}", probability);
             }
             else
             {
@@ -159,17 +158,16 @@ internal class AiChecks
         return (probability, pic, nameBioUser);
     }
 
-    public async ValueTask<double> GetSpamProbability(Message message)
+    public async ValueTask<SpamProbability> GetSpamProbability(Message message)
     {
-        var probability = 0.0;
+        var probability = new SpamProbability();
         if (_api == null)
             return probability;
 
         var text = message.Caption ?? message.Text;
         var cacheKey = $"llm_spam_prob:{text}";
-        var exists = MemoryCache.Default.Get(cacheKey) as double?;
-        if (exists.HasValue)
-            return exists.Value;
+        if (MemoryCache.Default.Get(cacheKey) is SpamProbability sp)
+            return sp;
 
         try
         {
@@ -205,9 +203,9 @@ internal class AiChecks
             );
             if (response.Value1 != null)
             {
-                probability = response.Value1.Probability;
-                MemoryCache.Default.Add(cacheKey, (double?)probability, new CacheItemPolicy { SlidingExpiration = TimeSpan.FromHours(1) });
-                _logger.LogInformation("LLM GetSpamProbability {Prob}", probability);
+                probability = response.Value1;
+                MemoryCache.Default.Add(cacheKey, probability, new CacheItemPolicy { SlidingExpiration = TimeSpan.FromHours(1) });
+                _logger.LogInformation("LLM GetSpamProbability {@Prob}", probability);
             }
         }
         catch (Exception e)
@@ -220,5 +218,6 @@ internal class AiChecks
     internal class SpamProbability()
     {
         public double Probability { get; set; }
+        public string Reason { get; set; } = "";
     }
 }
