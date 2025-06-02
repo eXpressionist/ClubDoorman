@@ -236,7 +236,22 @@ internal class MessageProcessor
         if (string.IsNullOrWhiteSpace(text))
         {
             _logger.LogDebug("Empty text/caption");
-            await DontDeleteButReportMessage(message, "картинка/видео/кружок/голосовуха без подписи", stoppingToken);
+            if (message.Photo != null && _config.OpenRouterApi != null && _config.NonFreeChat(chat.Id))
+            {
+                var spamCheck = await _aiChecks.GetSpamProbability(message);
+                if (spamCheck.Probability >= Consts.LlmLowProbability)
+                {
+                    var reason = $"LLM думает что это спам {spamCheck.Probability * 100}%{Environment.NewLine}{spamCheck.Reason}";
+                    if (spamCheck.Probability >= Consts.LlmHighProbability)
+                        await DeleteAndReportMessage(message, reason, stoppingToken);
+                    else
+                        await DontDeleteButReportMessage(message, reason, stoppingToken);
+                }
+            }
+            else
+            {
+                await DontDeleteButReportMessage(message, "картинка/видео/кружок/голосовуха без подписи", stoppingToken);
+            }
             return;
         }
         if (_badMessageManager.KnownBadMessage(text))
@@ -266,7 +281,18 @@ internal class MessageProcessor
         {
             _logger.LogDebug("TooManyEmojis");
             const string reason = "В этом сообщении многовато эмоджи";
-            await DeleteAndReportMessage(message, reason, stoppingToken);
+            if (_config.OpenRouterApi != null && _config.NonFreeChat(chat.Id))
+            {
+                var spamCheck = await _aiChecks.GetSpamProbability(message);
+                if (spamCheck.Probability >= Consts.LlmHighProbability)
+                    await AutoBan(message, $"{reason}{Environment.NewLine}{spamCheck.Reason}", stoppingToken);
+                else
+                    await DeleteAndReportMessage(message, $"{reason}{Environment.NewLine}{spamCheck.Reason}", stoppingToken);
+            }
+            else
+            {
+                await DeleteAndReportMessage(message, reason, stoppingToken);
+            }
             return;
         }
 
@@ -281,9 +307,24 @@ internal class MessageProcessor
         {
             var reason = $"ML решил что это спам, скор {score}";
             if (score > 3 && _config.HighConfidenceAutoBan)
+            {
                 await AutoBan(message, reason, stoppingToken);
+            }
             else
-                await DeleteAndReportMessage(message, reason, stoppingToken);
+            {
+                if (_config.OpenRouterApi != null && _config.NonFreeChat(chat.Id))
+                {
+                    var spamCheck = await _aiChecks.GetSpamProbability(message);
+                    if (spamCheck.Probability >= Consts.LlmHighProbability)
+                        await AutoBan(message, $"{reason}{Environment.NewLine}{spamCheck.Reason}", stoppingToken);
+                    else
+                        await DeleteAndReportMessage(message, $"{reason}{Environment.NewLine}{spamCheck.Reason}", stoppingToken);
+                }
+                else
+                {
+                    await DeleteAndReportMessage(message, reason, stoppingToken);
+                }
+            }
             return;
         }
 
@@ -292,7 +333,7 @@ internal class MessageProcessor
             var replyToRecentPost =
                 message.ReplyToMessage?.IsAutomaticForward == true
                 && DateTime.UtcNow - message.ReplyToMessage.Date < TimeSpan.FromMinutes(5);
-            var (attention, photo, bio) = await _aiChecks.GetAttentionBaitProbability(message.From, replyToRecentPost);
+            var (attention, photo, bio) = await _aiChecks.GetAttentionBaitProbability(message.From);
             _logger.LogDebug("GetAttentionBaitProbability, result = {Prob}", attention.Probability);
             if (attention.Probability >= Consts.LlmLowProbability)
             {
@@ -347,8 +388,7 @@ internal class MessageProcessor
             var spamCheck = await _aiChecks.GetSpamProbability(message);
             if (spamCheck.Probability >= Consts.LlmLowProbability)
             {
-                var reason =
-                    $"LLM думает что это спам {spamCheck.Probability * 100}%{Environment.NewLine}{spamCheck.Reason}";
+                var reason = $"LLM думает что это спам {spamCheck.Probability * 100}%{Environment.NewLine}{spamCheck.Reason}";
                 if (spamCheck.Probability >= Consts.LlmHighProbability)
                     await DeleteAndReportMessage(message, reason, stoppingToken);
                 else
@@ -494,7 +534,9 @@ internal class MessageProcessor
 
         var user = message.From!;
         var fromChat = message.SenderChat;
-        var forward = await _bot.ForwardMessage(admChat, message.Chat.Id, message.MessageId, cancellationToken: stoppingToken);
+        Message? forward = null;
+        if (_config.NonFreeChat(message.Chat.Id))
+            forward = await _bot.ForwardMessage(admChat, message.Chat.Id, message.MessageId, cancellationToken: stoppingToken);
         var deletionMessagePart = reason;
         try
         {
@@ -514,6 +556,9 @@ internal class MessageProcessor
             deletionMessagePart += ", сообщение НЕ удалено (не хватило могущества?).";
         }
 
+        if (!_config.NonFreeChat(message.Chat.Id))
+            return;
+
         var callbackDataBan = fromChat == null ? $"ban_{message.Chat.Id}_{user.Id}" : $"banchan_{message.Chat.Id}_{fromChat.Id}";
         MemoryCache.Default.Add(callbackDataBan, message, new CacheItemPolicy { AbsoluteExpiration = DateTimeOffset.UtcNow.AddDays(1) });
         var postLink = Utils.LinkToMessage(message.Chat, message.MessageId);
@@ -526,10 +571,11 @@ internal class MessageProcessor
         if (_config.ApproveButtonEnabled)
             row.Add(new InlineKeyboardButton("🥰🥰🥰 approve") { CallbackData = $"approve_{user.Id}" });
 
+        var username = user.Username == null ? "" : $" @{user.Username}";
         await _bot.SendMessage(
             admChat,
-            $"{deletionMessagePart}{Environment.NewLine}Юзер {Utils.FullName(user)} из чата {message.Chat.Title}{Environment.NewLine}{postLink}",
-            replyParameters: forward,
+            $"{deletionMessagePart}{Environment.NewLine}Юзер {Utils.FullName(user)}{username} из чата {message.Chat.Title}{Environment.NewLine}{postLink}",
+            replyParameters: forward!,
             replyMarkup: new InlineKeyboardMarkup(row),
             cancellationToken: stoppingToken
         );
