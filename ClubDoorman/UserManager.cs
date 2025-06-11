@@ -126,6 +126,16 @@ internal sealed class UserManager
         return banned;
     }
 
+    public async Task Unban(long userId, CancellationToken ct = default)
+    {
+        var key = $"user:banned:{userId}";
+        using var scope = _serviceScopeFactory.CreateScope();
+        using var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var count = await db.BlacklistedUsers.Where(x => x.Id == userId).ExecuteDeleteAsync(cancellationToken: ct);
+        await db.SaveChangesAsync(ct);
+        await _cache.RemoveAsync(key, ct);
+    }
+
     private async ValueTask<bool> GetUserBanned(long userId)
     {
         using var scope = _serviceScopeFactory.CreateScope();
