@@ -171,6 +171,9 @@ internal class MessageProcessor
         var user = message.From!;
         var text = message.Text ?? message.Caption;
 
+        if (message.Quote?.Text != null)
+            text = $"{message.Quote.Text} {text}";
+
         if (text != null)
             MemoryCache.Default.Set(
                 new CacheItem($"{chat.Id}_{user.Id}", text),
@@ -335,7 +338,10 @@ internal class MessageProcessor
             var replyToRecentPost =
                 message.ReplyToMessage?.IsAutomaticForward == true
                 && DateTime.UtcNow - message.ReplyToMessage.Date < TimeSpan.FromMinutes(5);
-            var (attention, photo, bio) = await _aiChecks.GetAttentionBaitProbability(message.From);
+            var (attention, photo, bio) = await _aiChecks.GetAttentionBaitProbability(
+                message.From,
+                x => DontDeleteButReportMessage(message, x, stoppingToken)
+            );
             _logger.LogDebug("GetAttentionBaitProbability, result = {Prob}", attention.Probability);
             if (attention.Probability >= Consts.LlmLowProbability)
             {
@@ -519,12 +525,18 @@ internal class MessageProcessor
         var forward = await _bot.ForwardMessage(admChat, message.Chat.Id, message.MessageId, cancellationToken: stoppingToken);
         var callbackData = fromChat == null ? $"ban_{message.Chat.Id}_{user.Id}" : $"banchan_{message.Chat.Id}_{fromChat.Id}";
         MemoryCache.Default.Add(callbackData, message, new CacheItemPolicy { AbsoluteExpiration = DateTimeOffset.UtcNow.AddHours(12) });
+
+        var postLink = Utils.LinkToMessage(message.Chat, message.MessageId);
+        var reply = "";
+        if (message.ReplyToMessage != null)
+            reply = $"{Environment.NewLine}реплай на {Utils.LinkToMessage(message.Chat, message.ReplyToMessage.MessageId)}";
+
         var msg =
             reason
             ?? "Это подозрительное сообщение - например, картинка/видео/кружок/голосовуха без подписи от 'нового' юзера, или сообщение от канала";
         await _bot.SendMessage(
             admChat,
-            $"{msg}. Сообщение НЕ удалено.{Environment.NewLine}Юзер {Utils.FullName(user)} из чата {message.Chat.Title}",
+            $"{msg}. Сообщение НЕ удалено.{Environment.NewLine}Юзер {Utils.FullName(user)} из чата {message.Chat.Title}{Environment.NewLine}{postLink}{reply}",
             replyParameters: forward.MessageId,
             replyMarkup: new InlineKeyboardMarkup(
                 new InlineKeyboardButton(Consts.BanButton) { CallbackData = callbackData },
@@ -569,6 +581,10 @@ internal class MessageProcessor
         var callbackDataBan = fromChat == null ? $"ban_{message.Chat.Id}_{user.Id}" : $"banchan_{message.Chat.Id}_{fromChat.Id}";
         MemoryCache.Default.Add(callbackDataBan, message, new CacheItemPolicy { AbsoluteExpiration = DateTimeOffset.UtcNow.AddDays(1) });
         var postLink = Utils.LinkToMessage(message.Chat, message.MessageId);
+        var reply = "";
+        if (message.ReplyToMessage != null)
+            reply = $"{Environment.NewLine}реплай на {Utils.LinkToMessage(message.Chat, message.ReplyToMessage.MessageId)}";
+
         var row = new List<InlineKeyboardButton>(
             [
                 new InlineKeyboardButton(Consts.BanButton) { CallbackData = callbackDataBan },
@@ -581,7 +597,7 @@ internal class MessageProcessor
         var username = user.Username == null ? "" : $" @{user.Username}";
         await _bot.SendMessage(
             admChat,
-            $"{deletionMessagePart}{Environment.NewLine}Юзер {Utils.FullName(user)}{username} из чата {message.Chat.Title}{Environment.NewLine}{postLink}",
+            $"{deletionMessagePart}{Environment.NewLine}Юзер {Utils.FullName(user)}{username} из чата {message.Chat.Title}{Environment.NewLine}{postLink}{reply}",
             replyParameters: forward!,
             replyMarkup: new InlineKeyboardMarkup(row),
             cancellationToken: stoppingToken
