@@ -137,14 +137,14 @@ internal class MessageProcessor
                         }
                         Message? fwd = null;
                         if (_config.NonFreeChat(chat.Id))
-                            fwd = await _bot.ForwardMessage(admChat, chat, message.MessageId, cancellationToken: stoppingToken);
+                            fwd = await _bot.ForwardMessage(_config.AdminChatId, chat, message.MessageId, cancellationToken: stoppingToken);
                         await _bot.DeleteMessage(chat, message.MessageId, stoppingToken);
                         await _bot.BanChatSenderChat(chat, message.SenderChat.Id, stoppingToken);
                         var stats = _statistics.Stats.GetOrAdd(chat.Id, new Stats(chat.Title) { Id = chat.Id });
                         stats.Channels++;
                         if (_config.NonFreeChat(chat.Id))
                             await _bot.SendMessage(
-                                admChat,
+                                _config.AdminChatId,
                                 $"Сообщение удалено, в чате {chat.Title} забанен канал {message.SenderChat.Title}",
                                 replyParameters: fwd!,
                                 cancellationToken: stoppingToken
@@ -172,7 +172,7 @@ internal class MessageProcessor
         var text = message.Text ?? message.Caption;
 
         if (message.Quote?.Text != null)
-            text = $"{message.Quote.Text} {text}";
+            text = $"> {message.Quote.Text}{Environment.NewLine}{text}";
 
         if (text != null)
             MemoryCache.Default.Set(
@@ -279,6 +279,24 @@ internal class MessageProcessor
             }
 
             await AutoBan(message, reason, stoppingToken);
+            return;
+        }
+
+        if (SimpleFilters.HasUnwantedChars(normalized))
+        {
+            const string reason = "В этом сообщении необычные буквы";
+            if (_config.OpenRouterApi != null && _config.NonFreeChat(chat.Id))
+            {
+                var spamCheck = await _aiChecks.GetSpamProbability(message);
+                if (spamCheck.Probability >= Consts.LlmHighProbability)
+                    await AutoBan(message, $"{reason}{Environment.NewLine}{spamCheck.Reason}", stoppingToken);
+                else
+                    await DeleteAndReportMessage(message, $"{reason}{Environment.NewLine}{spamCheck.Reason}", stoppingToken);
+            }
+            else
+            {
+                await DeleteAndReportMessage(message, reason, stoppingToken);
+            }
             return;
         }
 
@@ -497,8 +515,7 @@ internal class MessageProcessor
                 }
                 break;
             }
-            case ChatMemberStatus.Kicked
-            or ChatMemberStatus.Restricted:
+            case ChatMemberStatus.Kicked or ChatMemberStatus.Restricted:
                 if (!_config.NonFreeChat(chatMember.Chat.Id))
                     break;
                 var user = newChatMember.User;
