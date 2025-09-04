@@ -168,7 +168,7 @@ internal class CaptchaManager
         {
             var del = await _bot.SendMessage(
                 chatId,
-                $"Привет, [{Escape(fullName)}](tg://user?id={user.Id})! Антиспам: на какой кнопке {Captcha.CaptchaList[correctAnswer].Description}?",
+                $"Привет, [{Escape(fullName)}](tg://user?id={user.Id})! \nРеши капчу или бот тебя кикнет: нажми кнопку с эмодзи .. \n(Solve the captcha or bot will kick you, pick a button with ..)\n -> {Captcha.CaptchaList[correctAnswer].Description} <-",
                 parseMode: ParseMode.Markdown,
                 replyParameters: replyParams,
                 replyMarkup: new InlineKeyboardMarkup(keyboard)
