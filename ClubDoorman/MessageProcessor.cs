@@ -1,5 +1,8 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.Extensions.Caching.Hybrid;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types;
@@ -7,6 +10,8 @@ using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 
 namespace ClubDoorman;
+
+internal sealed record Msg(long ChatId, long MessageId, string UserFirst, string? UserLast, long UserId);
 
 internal class MessageProcessor
 {
@@ -23,6 +28,7 @@ internal class MessageProcessor
     private readonly ReactionHandler _reactionHandler;
     private readonly AdminCommandHandler _adminCommandHandler;
     private readonly RecentMessagesStorage _recentMessagesStorage;
+    private readonly HybridCache _hybridCache;
     private User? _me;
 
     public MessageProcessor(
@@ -37,7 +43,8 @@ internal class MessageProcessor
         Config config,
         ReactionHandler reactionHandler,
         AdminCommandHandler adminCommandHandler,
-        RecentMessagesStorage recentMessagesStorage
+        RecentMessagesStorage recentMessagesStorage,
+        HybridCache hybridCache
     )
     {
         _bot = bot;
@@ -52,6 +59,7 @@ internal class MessageProcessor
         _reactionHandler = reactionHandler;
         _adminCommandHandler = adminCommandHandler;
         _recentMessagesStorage = recentMessagesStorage;
+        _hybridCache = hybridCache;
     }
 
     public async Task HandleUpdate(Update update, CancellationToken stoppingToken)
@@ -91,6 +99,7 @@ internal class MessageProcessor
             return;
 
         var chat = message.Chat;
+        using var _chatScope = _logger.BeginScope("Chat {ChatName}", chat.Title);
         if (chat.Type == ChatType.Private)
         {
             await _bot.SendMessage(
@@ -190,6 +199,9 @@ internal class MessageProcessor
                 return;
 
             if (!_config.NonFreeChat(message.Chat.Id))
+                return;
+
+            if (text.Contains("http"))
                 return;
 
             var normalized_ = TextProcessor.NormalizeText(text);
@@ -341,6 +353,11 @@ internal class MessageProcessor
         {
             _logger.LogDebug("TooManyEmojis");
             const string reason = "В этом сообщении многовато эмоджи";
+
+            var firstLast = Utils.FullName(user);
+            if (SimpleFilters.InUsernameSuspiciousList(firstLast))
+                await AutoBan(message, "много эмодзи и имя из блеклиста", stoppingToken);
+
             if (text.Length > 10 && _config.OpenRouterApi != null && _config.NonFreeChat(chat.Id))
             {
                 var spamCheck = await _aiChecks.GetSpamProbability(message);
@@ -486,7 +503,7 @@ internal class MessageProcessor
         }
 
         // else - ham
-        if (score > -0.5 && _config.LowConfidenceHamForward && _config.NonFreeChat(message.Chat.Id))
+        if (score > -0.5 && _config.LowConfidenceHamForward && _config.NonFreeChat(chat.Id))
         {
             var forward = await _bot.ForwardMessage(_config.AdminChatId, chat.Id, message.MessageId, cancellationToken: stoppingToken);
             var postLink = Utils.LinkToMessage(chat, message.MessageId);
@@ -497,11 +514,57 @@ internal class MessageProcessor
                 cancellationToken: stoppingToken
             );
         }
+        if (!_config.NonFreeChat(chat.Id) && SimpleFilters.HasOnlyHelloWord(text))
+        {
+            await DontDeleteButReportMessage(message, "в этом сообщении написано привет и больше ничего, обычно это спамер", stoppingToken);
+            return;
+        }
+
         _logger.LogDebug("Classifier thinks its ham, score {Score}", score);
 
         // Now we need a mechanism for users who have been writing non-spam for some time
         if (update.Message != null && !userAttentionSpammer)
         {
+            if (text.Length > 10)
+            {
+                // just one last check!
+                var hash = SHA256.HashData(Encoding.UTF8.GetBytes(text));
+                var key = Convert.ToHexString(hash);
+                var justCreated = false;
+                var exists = await _hybridCache.GetOrCreateAsync(
+                    key,
+                    ct =>
+                    {
+                        justCreated = true;
+                        return ValueTask.FromResult(new Msg(chat.Id, message.Id, user.FirstName, user.LastName, user.Id));
+                    },
+                    new HybridCacheEntryOptions { LocalCacheExpiration = TimeSpan.FromDays(1) },
+                    cancellationToken: stoppingToken
+                );
+
+                if (!justCreated)
+                {
+                    const string reason = "точно такое же сообщение было недавно в других чатах, в котрых есть Швейцар, это подозрительно";
+                    await DontDeleteButReportMessage(message, reason, stoppingToken);
+                    await DontDeleteButReportMessage(
+                        new Message
+                        {
+                            Id = (int)exists.MessageId,
+                            Chat = new Chat { Id = chat.Id, Title = chat.Title },
+                            From = new User
+                            {
+                                Id = exists.UserId,
+                                FirstName = user.FirstName,
+                                LastName = user.LastName,
+                            },
+                        },
+                        reason,
+                        stoppingToken
+                    );
+                    return;
+                }
+            }
+
             var goodInteractions = _goodUserMessages.AddOrUpdate(user.Id, 1, (_, oldValue) => oldValue + 1);
             if (goodInteractions >= 3)
             {
