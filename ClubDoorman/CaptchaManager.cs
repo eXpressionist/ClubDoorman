@@ -140,7 +140,7 @@ internal class CaptchaManager
             return;
         }
 
-        const int challengeLength = 8;
+        const int challengeLength = 6;
         var correctAnswerIndex = Random.Shared.Next(challengeLength);
         var challenge = new List<int>(challengeLength);
         while (challenge.Count < challengeLength)
