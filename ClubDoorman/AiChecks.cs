@@ -44,11 +44,15 @@ internal class AiChecks
 
     private static string CacheKey(long userId) => $"attention:{userId}";
 
+    private static string ChatInfoCacheKey(long chatId) => $"chat_info:{chatId}";
+
+    private static string LinkedChannelInfoCacheKey(long channelId) => $"linked_channel_info:{channelId}";
+
     public async Task MarkUserOkay(long userId, CancellationToken ct = default)
     {
         await _hybridCache.SetAsync(
             CacheKey(userId),
-            new SpamPhotoBio(new SpamProbability(), [], ""),
+            new SpamPhotoBio(new BioClassProbability(), [], ""),
             new HybridCacheEntryOptions { LocalCacheExpiration = TimeSpan.FromDays(100) },
             cancellationToken: ct
         );
@@ -71,8 +75,8 @@ internal class AiChecks
     )
     {
         if (_api == null)
-            return new SpamPhotoBio(new SpamProbability(), [], "");
-        var probability = new SpamProbability();
+            return new SpamPhotoBio(new BioClassProbability(), [], "");
+        var probability = new BioClassProbability();
         var pic = Array.Empty<byte>();
 
         try
@@ -103,7 +107,7 @@ internal class AiChecks
             );
             if (response.Value1 != null)
             {
-                probability = response.Value1;
+                probability.EroticProbability = response.Value1.Probability;
                 _logger.LogInformation("LLM GetEroticPhotoBaitProbability: {@Prob}", probability);
             }
         }
@@ -114,15 +118,15 @@ internal class AiChecks
         return new SpamPhotoBio(probability, pic, Utils.FullName(user));
     }
 
-    public ValueTask<SpamPhotoBio> GetAttentionBaitProbability(
+    public async ValueTask<SpamPhotoBio> GetAttentionBaitProbability(
         Telegram.Bot.Types.User user,
         Func<string, Task>? ifChanged = default,
         bool checkJustErotic = false
     )
     {
         if (_api == null)
-            return ValueTask.FromResult(new SpamPhotoBio(new SpamProbability(), [], ""));
-        return _hybridCache.GetOrCreateAsync(
+            return new SpamPhotoBio(new BioClassProbability(), [], "");
+        return await _hybridCache.GetOrCreateAsync(
             CacheKey(user.Id),
             async ct =>
             {
@@ -132,9 +136,9 @@ internal class AiChecks
                     .HalfApprovedUsers.AsNoTracking()
                     .SingleOrDefaultAsync(x => x.Id == user.Id, cancellationToken: ct);
                 if (halfApproved != default)
-                    return new SpamPhotoBio(new SpamProbability(), [], "");
+                    return new SpamPhotoBio(new BioClassProbability(), [], "");
 
-                var probability = new SpamProbability();
+                var probability = new BioClassProbability();
                 var pic = Array.Empty<byte>();
                 var nameBioUser = string.Empty;
 
@@ -149,7 +153,7 @@ internal class AiChecks
                         _logger.LogDebug("GetAttentionBaitProbability {User}: no bio, no channel", Utils.FullName(user));
                         if (userChat.Photo != null)
                             return await GetEroticPhotoBaitProbability(user, userChat, ct);
-                        return new SpamPhotoBio(new SpamProbability(), [], "");
+                        return new SpamPhotoBio(new BioClassProbability(), [], "");
                     }
 
                     _logger.LogDebug("GetAttentionBaitProbability {User} cache miss, asking LLM", Utils.FullName(user));
@@ -181,7 +185,12 @@ internal class AiChecks
                     nameBioUser = sb.ToString();
                     var promptDebugString = nameBioUser;
                     var prompt =
-                        $"Проанализируй, выглядит ли этот Telegram-профиль как «продажный» и созданный с целью привлечения внимания. Отвечай вероятностью от 0 до 1. Особенно внимательно учитывай признаки:\nсексуализированные профили (эмодзи с двойным смыслом - 💦, 💋, 👄, 🍑, 🍆, 🍒, 🍓, 🍌 и прочих в имени, любой намёк на эротику и порно, голые фото), упоминания о курсах, заработке, трейдинге, арбитраже, привлечению трафика, ссылки на OnlyFans, соцсети. Обрати особенно внимание, если род занятий указан прямо в имени (например: HR, SMM, недвижимость, маркетинг). Обращай особое внимание на юзернеймы из бессмыслленого набора букв и цифр. Вот данные профиля:\n{nameBioUser}";
+                        "Проанализируй, выглядит ли этот Telegram-профиль как «продажный» и созданный с целью привлечения внимания. Отвечай вероятностью от 0 до 1.\n"
+                        + "В EroticProbability ответь, с какой вероятностью этот профиль сексуализирован, обрати внимание на эмодзи с двойным смыслом (💦💋👄🍑🍆🍒🍓🍌 и прочих) в имени, любой намёк на эротику и порно, голые фото, OnlyFans\n"
+                        + "В GamblingProbability ответь, с какой вероятностью профиль связан с предложениями рабогатеть - казино, гэмблинг, трейдинг, арбитаж, привлечению трафика, крипта\n"
+                        + $"В NonPersonProbability ответь, с какой вероятностью профиль даже не притворяется человеком (нет имени и фотографии человека, но например животное или персонаж из мультфильма это ок), а сразу выглядит как бизнес-аккаунт или реклама\n"
+                        + "В SelfPromotionProbability ответь, с какой вероятностью профиль направлен на само-продвижение, ОСОБЕННО если у него род деятельности или намёк на бизнес указан прямо в имени (например коучинг, HR, 'Алгоритм изобилия', 'Документы об образовании', 'Образование онлайн', 'Документы под ключ'), если у него предложение вступить в группу, подписываться, бесплатные продукты, документы, дипломы, сертификаты, и другие способы привлечения"
+                        + $"\nВот данные профиля:\n{nameBioUser}";
 
                     var messages = new List<ChatCompletionRequestMessage>
                     {
@@ -281,7 +290,7 @@ internal class AiChecks
 
                     var response = await _retry.ExecuteAsync(
                         async token =>
-                            await _api.Chat.CreateChatCompletionAsAsync<SpamProbability>(
+                            await _api.Chat.CreateChatCompletionAsAsync<BioClassProbability>(
                                 messages: messages,
                                 model: Model,
                                 strict: true,
@@ -293,7 +302,12 @@ internal class AiChecks
                     if (response.Value1 != null)
                     {
                         probability = response.Value1;
-                        if (probability.Probability < Consts.LlmLowProbability)
+                        if (
+                            probability.EroticProbability < Consts.LlmLowProbability
+                            && probability.NonPersonProbability < Consts.LlmLowProbability
+                            && probability.SelfPromotionProbability < Consts.LlmLowProbability
+                            && probability.GamblingProbability < Consts.LlmLowProbability
+                        )
                             pic = []; // cache optimization, don't store all user photos who are not spammers
                         _logger.LogInformation("LLM GetAttentionBaitProbability: {@Prob}", probability);
                     }
@@ -312,6 +326,62 @@ internal class AiChecks
         );
     }
 
+    internal record ChatDescription(string Description, long? ChannelId);
+
+    private async ValueTask<ChatDescription?> GetChatInfoAsync(long chatId, CancellationToken ct = default)
+    {
+        return await _hybridCache.GetOrCreateAsync<ChatDescription?>(
+            ChatInfoCacheKey(chatId),
+            async ct =>
+            {
+                try
+                {
+                    var chat = await _bot.GetChat(chatId, cancellationToken: ct);
+                    var info = new StringBuilder();
+                    info.AppendLine($"Чат: {chat.Title}");
+                    if (chat.Description != null)
+                        info.AppendLine($"Описание чата: {chat.Description}");
+
+                    return new(info.ToString(), chat.LinkedChatId);
+                }
+                catch (Exception e)
+                {
+                    _logger.LogWarning(e, "Failed to get chat info for {ChatId}", chatId);
+                    return null;
+                }
+            },
+            new HybridCacheEntryOptions { LocalCacheExpiration = TimeSpan.FromHours(24) },
+            cancellationToken: ct
+        );
+    }
+
+    private async ValueTask<string> GetLinkedChannelInfoAsync(long channelId, CancellationToken ct = default)
+    {
+        return await _hybridCache.GetOrCreateAsync(
+            LinkedChannelInfoCacheKey(channelId),
+            async ct =>
+            {
+                try
+                {
+                    var linkedChat = await _bot.GetChat(channelId, cancellationToken: ct);
+                    var info = new StringBuilder();
+                    info.AppendLine($"Этот чат - чат обсуждения для канала: {linkedChat.Title}");
+                    if (linkedChat.Description != null)
+                        info.AppendLine($"Описание канала: {linkedChat.Description}");
+
+                    return info.ToString();
+                }
+                catch (Exception e)
+                {
+                    _logger.LogWarning(e, "Failed to get linked channel info for {ChannelId}", channelId);
+                    return string.Empty;
+                }
+            },
+            new HybridCacheEntryOptions { LocalCacheExpiration = TimeSpan.FromHours(24) },
+            cancellationToken: ct
+        );
+    }
+
     private async Task CheckLater(ChatFullInfo userChat, Func<string, Task> ifChanged)
     {
         try
@@ -322,7 +392,7 @@ internal class AiChecks
             var wait = TimeSpan.Zero;
             for (var i = 1; i <= 3; i++)
             {
-                wait += TimeSpan.FromMinutes(5 * i);
+                wait += TimeSpan.FromMinutes(Math.Exp(i) / 2);
                 await Task.Delay(wait);
                 var chat = await _bot.GetChat(userChat.Id);
                 if (chat.Photo?.BigFileUniqueId != userChat.Photo?.BigFileUniqueId)
@@ -358,23 +428,56 @@ internal class AiChecks
         }
     }
 
-    public ValueTask<SpamProbability> GetSpamProbability(Message message)
+    public async ValueTask<SpamProbability> GetSpamProbability(Message message)
     {
         var probability = new SpamProbability();
         if (_api == null)
-            return ValueTask.FromResult(probability);
+            return probability;
 
         var text = message.Caption ?? message.Text;
         if (message.Quote?.Text != null)
             text = $"> {message.Quote.Text}{Environment.NewLine}{text}";
         var cacheKey = $"llm_spam_prob:{ShaHelper.ComputeSha256Hex(text)}";
 
-        return _hybridCache.GetOrCreateAsync(
+        return await _hybridCache.GetOrCreateAsync(
             cacheKey,
             async ct =>
             {
                 try
                 {
+                    var contextBuilder = new StringBuilder();
+
+                    var info = await GetChatInfoAsync(message.Chat.Id, ct);
+                    if (info != null)
+                    {
+                        var (chatInfoText, linked) = info;
+                        contextBuilder.AppendLine(chatInfoText);
+                        try
+                        {
+                            if (linked.HasValue)
+                            {
+                                var linkedChannelInfo = await GetLinkedChannelInfoAsync(linked.Value, ct);
+                                contextBuilder.AppendLine(linkedChannelInfo);
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            _logger.LogWarning(e, "Failed to get linked channel for chat {ChatId}", message.Chat.Id);
+                        }
+
+                        var text = message.ReplyToMessage?.Text ?? message.ReplyToMessage?.Caption;
+                        if (!string.IsNullOrEmpty(text))
+                        {
+                            contextBuilder.AppendLine("###");
+                            if (message.ReplyToMessage?.IsAutomaticForward == true)
+                                contextBuilder.AppendLine("Пост в канале, на который отвечают:");
+                            else
+                                contextBuilder.AppendLine("Сообщение, на которое отвечают:");
+
+                            contextBuilder.AppendLine(text);
+                        }
+                    }
+
                     byte[]? imageBytes = null;
                     if (message.Photo != null)
                     {
@@ -384,12 +487,23 @@ internal class AiChecks
                     }
 
                     var promt =
-                        $"Проанализируй, выглядит ли это сообщение как спам или мошенничество, созданное с целью привлечения внимания и продвижения. Отвечай вероятностью от 0 до 1. Частые примеры: казино, гэмблинг, наркотики, эротика, порно, сексуализированные сообщения, схема заработка с обещаниями высокой прибыли, схема заработка без подробностей, неофициальное трудоустройство, срочный набор на работу, NFT, крипто, призыв перейти по ссылке, призыв писать в личные сообщения, услуги рассылки и продвижения, выпрашивание денег под жалобным предлогом, предложение поделиться ресурсами и книгами по трейдингу или инвестициям, промокоды, реклама, увеличение трафика или потока клиентов, подарочные сертификаты и другие цифровые промокоды со скидкой. Сообщение:\n";
+                        $"Проанализируй, выглядит ли это сообщение как спам или мошенничество, созданное с целью привлечения внимания и продвижения. Отвечай вероятностью от 0 до 1. Частые примеры: казино, гэмблинг, наркотики, эротика, порно, сексуализированные сообщения, схема заработка с обещаниями высокой прибыли, схема заработка без подробностей, неофициальное трудоустройство, срочный набор на работу, NFT, крипто, призыв перейти по ссылке, призыв писать в личные сообщения, услуги рассылки и продвижения, выпрашивание денег под жалобным предлогом, предложение поделиться ресурсами и книгами по трейдингу или инвестициям, промокоды, реклама, увеличение трафика или потока клиентов, подарочные сертификаты и другие цифровые промокоды со скидкой. Обрати внимание если язык на котором общаются в чате и язык сообщения не совпадают (например, в чате пишут по-русски, а в сообщении 'привет' по-арабски).";
+
+                    var fullPrompt = new StringBuilder();
+                    fullPrompt.AppendLine(promt);
+                    fullPrompt.AppendLine("###");
+                    fullPrompt.AppendLine("Контекст сообщения:");
+                    fullPrompt.AppendLine(contextBuilder.ToString());
+                    fullPrompt.AppendLine("###");
+                    fullPrompt.AppendLine($"Само сообщение, которое нужно проанализировать:\n{text}");
+
+                    var fpString = fullPrompt.ToString();
+                    _logger.LogDebug("Spam prompt {Prompt}", fpString);
 
                     var messages = new List<ChatCompletionRequestMessage>
                     {
                         "Ты — модератор Telegram-группы, оценивающий сообщения в чате на спам, мошенничество и продвижения сторонних ресурсов или услуг".AsSystemMessage(),
-                        (promt + text).AsUserMessage(),
+                        fpString.AsUserMessage(),
                     };
                     if (imageBytes != null)
                         messages.Add(
@@ -446,5 +560,14 @@ internal class AiChecks
         public string Reason { get; set; } = "";
     }
 
-    internal sealed record SpamPhotoBio(SpamProbability SpamProbability, byte[] Photo, string NameBio);
+    internal sealed class BioClassProbability()
+    {
+        public double EroticProbability { get; set; }
+        public double GamblingProbability { get; set; }
+        public double NonPersonProbability { get; set; }
+        public double SelfPromotionProbability { get; set; }
+        public string Reason { get; set; } = "";
+    }
+
+    internal sealed record SpamPhotoBio(BioClassProbability Probability, byte[] Photo, string NameBio);
 }

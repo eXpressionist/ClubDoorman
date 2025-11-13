@@ -5,10 +5,9 @@ namespace ClubDoorman;
 public static class SimpleFilters
 {
     private static readonly string[] StopWords = File.ReadAllLines("data/stop-words.txt");
-    private static readonly string[] HelloWordsStop = ["привет", "hi", "الو", "سلام"];
+    private static readonly string[] HelloWordsStop = ["привет", "hi", "hello", "الو", "سلام"];
 
-    public static bool HasOnlyHelloWord(string message) =>
-        HelloWordsStop.Any(sw => message == sw);
+    public static bool HasOnlyHelloWord(string message) => HelloWordsStop.Any(sw => message == sw);
 
     public static bool HasStopWords(string message) =>
         StopWords.Any(sw => message.Contains(sw, StringComparison.InvariantCultureIgnoreCase));
@@ -23,6 +22,14 @@ public static class SimpleFilters
             return true;
 
         return false;
+    }
+
+    public static bool JustOneEmoji(string message)
+    {
+        if (message.Length > 4)
+            return false;
+        var (emojis, total) = CountEmojis(message);
+        return total == 1 && emojis == total;
     }
 
     private static (int emoji, int total) CountEmojis(string text)
@@ -83,7 +90,23 @@ public static class SimpleFilters
         return false;
     }
 
-    private static readonly List<string> _usernameBlacklist = ["Василиса", "Юлия", "Регина", "Аглая"];
+    private static readonly List<string> _usernameBlacklist =
+    [
+        "Аврора",
+        "Алиночка",
+        "Анечка",
+        "Аглая",
+        "Alina",
+        "Варвара",
+        "Василиса",
+        "Vasilisa",
+        "Кристина",
+        "Регина",
+        "Стася",
+        "Стефания",
+        "Юлия",
+    ];
+
     public static bool InUsernameSuspiciousList(string name) => _usernameBlacklist.Contains(name);
 
     public static List<string> FindAllRussianWordsWithLookalikeSymbols(string message) =>
