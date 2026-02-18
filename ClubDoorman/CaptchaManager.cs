@@ -126,6 +126,8 @@ internal partial class CaptchaManager
 
     public async ValueTask IntroFlow(User user, Chat chat)
     {
+        if (user.IsBot)
+            return;
         if (_userManager.Approved(user.Id))
             return;
         var clubUser = await _userManager.GetClubUsername(user.Id);
