@@ -156,7 +156,7 @@ internal partial class CaptchaManager
             return;
         }
 
-        const int challengeLength = 8;
+        const int challengeLength = 6;
         var correctAnswerIndex = Random.Shared.Next(challengeLength);
         var challenge = new List<int>(challengeLength);
         while (challenge.Count < challengeLength)
@@ -185,7 +185,7 @@ internal partial class CaptchaManager
         {
             var del = await _bot.SendMessage(
                 chatId,
-                $"Привет, [{Escape(fullName)}](tg://user?id={user.Id})! Антиспам: на какой кнопке {Captcha.CaptchaList[correctAnswer].Description}?",
+                $"Привет, [{Escape(fullName)}](tg://user?id={user.Id})! Антиспам: на какой кнопке {Captcha.CaptchaList[correctAnswer].Description}? (Push a button with correct emoji)",
                 parseMode: ParseMode.Markdown,
                 replyMarkup: new InlineKeyboardMarkup(keyboard)
             );
