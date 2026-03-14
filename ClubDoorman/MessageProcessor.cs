@@ -351,7 +351,7 @@ internal class MessageProcessor
         using var logScopeName = _logger.BeginScope("User {Usr}", Utils.FullName(user));
         _recentMessagesStorage.Add(user.Id, chat.Id, message);
 
-        var contentResult = await CheckMessageContent(message, user, rawText ?? "", text ?? "", chat, stoppingToken);
+        var contentResult = await CheckMessageContent(message, user, rawText ?? "", text ?? "", chat, admChat, stoppingToken);
         if (contentResult == CheckResult.NoMoreAction)
             return;
 
@@ -376,6 +376,7 @@ internal class MessageProcessor
         string rawText,
         string text,
         Chat chat,
+        long admChat,
         CancellationToken stoppingToken
     )
     {
@@ -545,10 +546,10 @@ internal class MessageProcessor
 
         if (score > -0.5 && _config.LowConfidenceHamForward && _config.NonFreeChat(chat.Id))
         {
-            var forward = await _bot.ForwardMessage(_config.AdminChatId, chat.Id, message.MessageId, cancellationToken: stoppingToken);
+            var forward = await _bot.ForwardMessage(admChat, chat.Id, message.MessageId, cancellationToken: stoppingToken);
             var postLink = Utils.LinkToMessage(chat, message.MessageId);
             await _bot.SendMessage(
-                _config.AdminChatId,
+                admChat,
                 $"Классифаер думает что это НЕ спам, но конфиденс низкий: скор {score}. Хорошая идея - добавить сообщение в датасет.{Environment.NewLine}Юзер {Utils.FullName(user)} из чата {chat.Title}{Environment.NewLine}{postLink}",
                 replyParameters: forward,
                 cancellationToken: stoppingToken
@@ -858,7 +859,7 @@ internal class MessageProcessor
         var fullName = Utils.FullName(user);
         var chat = message.Chat;
         _logger.LogDebug("Autoban. Chat: {Chat} {Id} User: {User}", chat.Title, chat.Id, fullName);
-        var admChat = _config.AdminChatId;
+	var admChat = _config.GetAdminChat(chat.Id);
         if (_config.NonFreeChat(chat.Id))
         {
             var forward = await _bot.ForwardMessage(admChat, chat.Id, message.MessageId, cancellationToken: stoppingToken);
