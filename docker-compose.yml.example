@@ -1,6 +1,6 @@
 services:
   doorman:
-    image: ghcr.io/tiraelsedai/clubdoorman:latest
+    image: ghcr.io/expressionist/clubdoorman:latest
     container_name: doorman
     environment:
       - TZ=Europe/Moscow
@@ -20,7 +20,8 @@ services:
       - DOORMAN_CAPTCHA_DISABLE=${DOORMAN_CAPTCHA_DISABLE}
       - DOORMAN_CHANNELS_EMOJI_DISABLE=${DOORMAN_CHANNELS_EMOJI_DISABLE}
       - DOORMAN_APPROVED_ML_SPAM_CHECK_DISABLE=${DOORMAN_APPROVED_ML_SPAM_CHECK_DISABLE}
+      - DOORMAN_CHANNELS_IGNORE_REPORT=${DOORMAN_CHANNELS_IGNORE_REPORT}
 
     volumes:
-      - ./ClubDoorman/data:/app/data
+      - /home/ClubDoorman/data:/app/data
     restart: unless-stopped
