@@ -28,6 +28,8 @@ internal class MessageProcessor
     private const string EmojiOnlyCheckText =
         "Антиспам, у вас одни эмоджи в сообщении. Лайкните моё сообщение чтобы доказать что вы не бот, у вас 30 секунд.";
     private const string EmojiOnlyTimeoutReason = "В сообщении только эмоджи, пользователь не подтвердил что он не бот";
+    private const string EmojiOnlyReactionsDisabledReason =
+        "В сообщении только эмоджи, проверка на бота отключена потому что в группе выключены реакции";
 
     private static readonly TimeSpan[] NewcomerBanlistCheckAfterJoin =
     [
@@ -608,6 +610,12 @@ internal class MessageProcessor
 
     private async Task<CheckResult> HandleEmojiOnlyMessage(Message message, CancellationToken stoppingToken)
     {
+        if (await ChatHasReactionsDisabled(message.Chat.Id, stoppingToken))
+        {
+            await DeleteAndReportMessage(message, EmojiOnlyReactionsDisabledReason, stoppingToken);
+            return CheckResult.NoMoreAction;
+        }
+
         Message? checkMessage;
         try
         {
@@ -637,6 +645,28 @@ internal class MessageProcessor
 
         await DeleteAndReportMessage(message, EmojiOnlyTimeoutReason, stoppingToken);
         return CheckResult.NoMoreAction;
+    }
+
+    private async ValueTask<bool> ChatHasReactionsDisabled(long chatId, CancellationToken stoppingToken)
+    {
+        try
+        {
+            return await _hybridCache.GetOrCreateAsync(
+                $"reactions_disabled:{chatId}",
+                async ct =>
+                {
+                    var chat = await _bot.GetChat(chatId, cancellationToken: ct);
+                    return chat.AvailableReactions is { Length: 0 };
+                },
+                new HybridCacheEntryOptions { LocalCacheExpiration = TimeSpan.FromMinutes(5) },
+                cancellationToken: stoppingToken
+            );
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            _logger.LogWarning(e, "Unable to fetch chat info to detect reactions availability");
+            return false;
+        }
     }
 
     private async Task<CheckResult> CheckUserProfile(
@@ -715,7 +745,7 @@ internal class MessageProcessor
 
         if (replyToRecentPost)
             _logger.LogDebug("It's a reply to recent post, high alert");
-        var bioInvite = bio.Contains("t.me/+");
+        var bioInvite = bio.Contains("t.me/+") || bio.Contains("bot?start");
         var bioObscured = SimpleFilters.FindAllRussianWordsWithLookalikeSymbols(bio).Count > 0;
 
         bool highErotic =
