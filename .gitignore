@@ -6,3 +6,4 @@
 /.idea/**
 /ClubDoorman.sln.DotSettings.user
 ClubDoorman/ClubDoorman.csproj.user
+*.orig
