@@ -30,12 +30,6 @@ internal sealed record AdminForwardFallbackMessage(
     string? Caption = null
 );
 
-internal sealed class ChatIgnoreState
-{
-    public int FailureCount { get; set; }
-    public DateTime IgnoreUntil { get; set; }
-}
-
 internal class MessageProcessor
 {
     private static readonly TimeSpan EmojiOnlyCheckWait = TimeSpan.FromSeconds(30);
@@ -63,7 +57,6 @@ internal class MessageProcessor
     private readonly AiChecks _aiChecks;
     private readonly CaptchaManager _captchaManager;
     private readonly ConcurrentDictionary<long, int> _goodUserMessages = new();
-    private readonly ConcurrentDictionary<long, ChatIgnoreState> _ignoredChats = new();
     private readonly StatisticsReporter _statistics;
     private readonly Config _config;
     private readonly ReactionHandler _reactionHandler;
@@ -239,11 +232,6 @@ internal class MessageProcessor
             return;
         }
 
-        if (_ignoredChats.TryGetValue(chat.Id, out var ignoreState) && DateTime.UtcNow < ignoreState.IgnoreUntil)
-        {
-            _logger.LogDebug("Ignoring chat {ChatId} until {IgnoreUntil} due to repeated failures", chat.Id, ignoreState.IgnoreUntil);
-            return;
-        }
         if (chat.Type == ChatType.Private)
         {
             await _bot.SendMessage(
@@ -289,7 +277,6 @@ internal class MessageProcessor
                 var stats = _statistics.Stats.GetOrAdd(chat.Id, new Stats(chat.Title) { Id = chat.Id });
                 stats.BlacklistBanned++;
                 var deleteFailed = false;
-                var banFailed = false;
                 try
                 {
                     await _bot.DeleteMessage(chat.Id, message.MessageId, stoppingToken);
@@ -306,29 +293,10 @@ internal class MessageProcessor
                 catch (ApiRequestException e)
                 {
                     _logger.LogInformation(e, "Cannot ban user");
-                    banFailed = true;
                 }
 
-                if (deleteFailed && banFailed && !_config.NonFreeChat(chat.Id))
-                {
-                    var state = _ignoredChats.AddOrUpdate(
-                        chat.Id,
-                        _ => new ChatIgnoreState { FailureCount = 1, IgnoreUntil = DateTime.UtcNow.AddHours(6) },
-                        (_, existing) =>
-                        {
-                            existing.FailureCount++;
-                            existing.IgnoreUntil = DateTime.UtcNow.AddHours(4 * existing.FailureCount);
-                            return existing;
-                        }
-                    );
-                    _logger.LogWarning(
-                        "Both delete and ban failed for free chat {ChatId} {ChatTitle}. Ignoring for {Hours} hour(s) until {IgnoreUntil}",
-                        chat.Id,
-                        chat.Title,
-                        state.FailureCount,
-                        state.IgnoreUntil
-                    );
-                }
+                if (deleteFailed)
+                    await NagForDeleteRights(message, "Пользователь в блеклисте спамеров", stoppingToken);
             }
             else
             {
@@ -370,6 +338,10 @@ internal class MessageProcessor
 
         var contentResult = await CheckMessageContent(message, user, rawText ?? "", text ?? "", chat, stoppingToken);
         if (contentResult == CheckResult.NoMoreAction)
+            return;
+
+        var bioResult = await CheckUserBio(message, user, stoppingToken);
+        if (bioResult == CheckResult.NoMoreAction)
             return;
 
         var profileResult = await CheckUserProfile(message, user, text ?? "", chat, admChat, stoppingToken);
@@ -687,6 +659,29 @@ internal class MessageProcessor
         }
     }
 
+    private async Task<CheckResult> CheckUserBio(Message message, User user, CancellationToken stoppingToken)
+    {
+        string? bio;
+        try
+        {
+            var userChat = await _bot.GetChat(user.Id, cancellationToken: stoppingToken);
+            bio = userChat.Bio;
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            _logger.LogWarning(e, "Unable to fetch chat info for bio check");
+            return CheckResult.Pass;
+        }
+        if (string.IsNullOrEmpty(bio))
+            return CheckResult.Pass;
+        if (MyRegexes.CryptoPrivatkiBio().IsMatch(bio))
+        {
+            await AutoBan(message, "крипто-приватки в описании профиля", stoppingToken);
+            return CheckResult.NoMoreAction;
+        }
+        return CheckResult.Pass;
+    }
+
     private async Task<CheckResult> CheckUserProfile(
         Message message,
         User user,
@@ -918,17 +913,92 @@ internal class MessageProcessor
                 cancellationToken: stoppingToken
             );
         }
-        await _bot.DeleteMessage(chat, message.MessageId, cancellationToken: stoppingToken);
+        var deleteFailed = false;
+        try
+        {
+            await _bot.DeleteMessage(chat, message.MessageId, cancellationToken: stoppingToken);
+        }
+        catch (ApiRequestException e)
+        {
+            _logger.LogInformation(e, "Autoban: cannot delete message");
+            deleteFailed = true;
+        }
         var stats = _statistics.Stats.GetOrAdd(chat.Id, new Stats(chat.Title) { Id = chat.Id });
         stats.Autoban++;
-        await _bot.BanChatMember(chat, user.Id, revokeMessages: false, cancellationToken: stoppingToken);
+        try
+        {
+            await _bot.BanChatMember(chat, user.Id, revokeMessages: false, cancellationToken: stoppingToken);
+        }
+        catch (ApiRequestException e)
+        {
+            _logger.LogInformation(e, "Autoban: cannot ban user");
+        }
+        if (deleteFailed)
+            await NagForDeleteRights(message, reason, stoppingToken);
+    }
+
+    private const string NoRightsNag =
+        "Распознал это как спам, но у меня нет прав удалять сообщения. "
+        + "Дайте мне права на удаление и бан, или если больше не нуждаетесь в моих услугах "
+        + "- удалите меня из чата. Спасибо.";
+
+    private static readonly TimeSpan NagSelfDeleteAfter = TimeSpan.FromMinutes(30);
+
+    // Только для free-чатов: если автобан не смог удалить сообщение (нет прав), ждём 5 сек
+    // (вдруг удалит другой бот), затем форвардим спам в админку как проверку существования —
+    // если форвард прошёл, сообщение живо, постим публичный реплай с просьбой выдать права.
+    private async Task NagForDeleteRights(Message message, string reason, CancellationToken stoppingToken)
+    {
+        var chat = message.Chat;
+        if (_config.NonFreeChat(chat.Id))
+            return;
+        var user = message.From!;
+
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
+        var admChat = _config.GetAdminChat(chat.Id);
+        Message forward;
+        try
+        {
+            forward = await _bot.ForwardMessage(admChat, chat.Id, message.MessageId, cancellationToken: stoppingToken);
+        }
+        catch (ApiRequestException)
+        {
+            _logger.LogDebug("Spam message {Id} in chat {Chat} is gone, skipping nag", message.MessageId, chat.Title);
+            return;
+        }
+
+        var text =
+            $"Распознал спам, но нет прав на удаление. Причина: {reason}{Environment.NewLine}"
+            + $"Юзер {Utils.FullName(user)} в чате {chat.Title}{Environment.NewLine}"
+            + Utils.LinkToMessage(chat, message.MessageId);
+        var chatLink = Utils.LinkToChat(chat);
+        if (!string.IsNullOrEmpty(chatLink))
+            text += Environment.NewLine + chatLink;
+        await _bot.SendMessage(admChat, text, replyParameters: forward, cancellationToken: stoppingToken);
+
+        try
+        {
+            var nag = await _bot.SendMessage(chat.Id, NoRightsNag, replyParameters: message, cancellationToken: stoppingToken);
+            DeleteMessageLater(chat.Id, nag.MessageId, NagSelfDeleteAfter, stoppingToken)
+                .FireAndForget(_logger, nameof(DeleteMessageLater));
+        }
+        catch (ApiRequestException e)
+        {
+            _logger.LogInformation(e, "Cannot post public nag reply");
+        }
     }
 
     private void WatchNewcomer(Chat chat, User user, CancellationToken stoppingToken)
     {
         if (!_config.BlacklistAutoBan)
-            return;
-        if (_ignoredChats.ContainsKey(chat.Id))
             return;
 
         var key = (chat.Id, user.Id);
@@ -1289,6 +1359,19 @@ internal class MessageProcessor
             _logger.LogInformation(are, "Cannot send fallback message to admin chat");
             return null;
         }
+    }
+
+    private async Task DeleteMessageLater(ChatId chatId, int messageId, TimeSpan delay, CancellationToken stoppingToken)
+    {
+        try
+        {
+            await Task.Delay(delay, stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        await DeleteMessageSafe(chatId, messageId, stoppingToken);
     }
 
     private async Task DeleteMessageSafe(ChatId chatId, int messageId, CancellationToken stoppingToken)
