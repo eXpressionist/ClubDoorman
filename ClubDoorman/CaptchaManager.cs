@@ -153,7 +153,7 @@ internal partial class CaptchaManager
             // The captcha is ephemeral: only the newcomer sees it, so no need to sanitize their name for the chat
             var sent = await _bot.SendMessage(
                 chatId,
-                $"Привет, {Utils.FullName(user)}! Антиспам: на какой кнопке {Captcha.CaptchaList[correctAnswer].Description}?",
+                $"Привет, {Utils.FullName(user)}! Антиспам: на какой кнопке {Captcha.CaptchaList[correctAnswer].Description}? (Push a button with correct emoji or be kicked)",
                 replyMarkup: keyboard,
                 receiverUserId: user.Id
             );
@@ -207,7 +207,7 @@ internal partial class CaptchaManager
         {
             sent = await _bot.SendMessage(
                 message.Chat.Id,
-                $"{prompt} Нажмите кнопку, на которой {Captcha.CaptchaList[correctAnswer].Description}, у вас {wait.TotalSeconds:0} секунд.",
+                $"{prompt} Нажмите кнопку, на которой |Press a button with| {Captcha.CaptchaList[correctAnswer].Description}, у вас |you have| {wait.TotalSeconds:0} сек|sec|",
                 replyParameters: message,
                 replyMarkup: keyboard,
                 receiverUserId: user.Id,
@@ -229,7 +229,7 @@ internal partial class CaptchaManager
     {
         var prefix = challengedMessageId is null ? JoinCaptchaPrefix : InlineCaptchaPrefix;
         var suffix = challengedMessageId is { } id ? $"_{id}" : "";
-        const int challengeLength = 8;
+        const int challengeLength = 6;
         var indexes = Enumerable.Range(0, Captcha.CaptchaList.Count).ToArray();
         Random.Shared.Shuffle(indexes);
         var challenge = indexes[..challengeLength];
