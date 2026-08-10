@@ -33,11 +33,8 @@ internal sealed record AdminForwardFallbackMessage(
 internal class MessageProcessor
 {
     private static readonly TimeSpan EmojiOnlyCheckWait = TimeSpan.FromSeconds(30);
-    private const string EmojiOnlyCheckText =
-        "Антиспам, у вас одни эмоджи в сообщении. Лайкните моё сообщение чтобы доказать что вы не бот, у вас 30 секунд.";
+    private const string EmojiOnlyCheckPrompt = "Антиспам, у вас одни эмоджи в сообщении. Докажите что вы не бот.";
     private const string EmojiOnlyTimeoutReason = "В сообщении только эмоджи, пользователь не подтвердил что он не бот";
-    private const string EmojiOnlyReactionsDisabledReason =
-        "В сообщении только эмоджи, проверка на бота отключена потому что в группе выключены реакции";
 
     private static readonly TimeSpan[] NewcomerBanlistCheckAfterJoin =
     [
@@ -116,10 +113,11 @@ internal class MessageProcessor
                 return;
             var msg = cb.Message;
 
-            if (msg == null || msg.Chat.Id == _config.AdminChatId || _config.MultiAdminChatMap.Values.Contains(msg.Chat.Id))
-                await _adminCommandHandler.HandleAdminCallback(cb.Data, cb);
-            else
+            // Route by prefix: an ephemeral captcha lives in the user's chat, but its Message may not look like one
+            if (cb.Data.StartsWith("cap", StringComparison.Ordinal))
                 await _captchaManager.HandleCaptchaCallback(update);
+            else if (msg == null || msg.Chat.Id == _config.AdminChatId || _config.MultiAdminChatMap.Values.Contains(msg.Chat.Id))
+                await _adminCommandHandler.HandleAdminCallback(cb.Data, cb);
             return;
         }
         if (update.ChatMember != null)
@@ -202,7 +200,7 @@ internal class MessageProcessor
                 && !approvedText.Contains("http")
             )
             {
-                var normalized = TextProcessor.NormalizeText(approvedText);
+                var normalized = TextProcessor.NormalizeText(Utils.TextWithLinks(message)!);
                 if (normalized.Length >= 10)
                 {
                     var (spam, score) = await _classifier.IsSpam(normalized);
@@ -327,16 +325,18 @@ internal class MessageProcessor
             return;
         }
 
+        var quote = message.Quote?.Text != null ? $"> {message.Quote.Text}{Environment.NewLine}" : "";
         var rawText = message.Text ?? message.Caption;
-        var text = rawText;
-        if (message.Quote?.Text != null)
-            text = $"> {message.Quote.Text}{Environment.NewLine}{text}";
+        var text = $"{quote}{rawText}";
+        // hidden urls belong in the ML/LLM checks, but not in the shape heuristics or in the auto-ban and dedup keys,
+        // which should still match a campaign that rotates its link per chat
+        var expandedText = $"{quote}{Utils.TextWithLinks(message)}";
 
         _logger.LogDebug("First-time message, chat {Chat} user {User}, message {Message}", chat.Title, Utils.FullName(user), text);
         using var logScopeName = _logger.BeginScope("User {Usr}", Utils.FullName(user));
         _recentMessagesStorage.Add(user.Id, chat.Id, message);
 
-        var contentResult = await CheckMessageContent(message, user, rawText ?? "", text ?? "", chat, stoppingToken);
+        var contentResult = await CheckMessageContent(message, user, rawText ?? "", text, expandedText, chat, stoppingToken);
         if (contentResult == CheckResult.NoMoreAction)
             return;
 
@@ -344,7 +344,7 @@ internal class MessageProcessor
         if (bioResult == CheckResult.NoMoreAction)
             return;
 
-        var profileResult = await CheckUserProfile(message, user, text ?? "", chat, admChat, stoppingToken);
+        var profileResult = await CheckUserProfile(message, user, text, chat, admChat, stoppingToken);
         if (profileResult == CheckResult.NoMoreAction)
             return;
 
@@ -364,6 +364,7 @@ internal class MessageProcessor
         User user,
         string rawText,
         string text,
+        string expandedText,
         Chat chat,
         CancellationToken stoppingToken
     )
@@ -411,7 +412,7 @@ internal class MessageProcessor
             await HandleBadMessage(message, user, stoppingToken);
             return CheckResult.NoMoreAction;
         }
-        var normalized = TextProcessor.NormalizeText(text);
+        var normalized = TextProcessor.NormalizeText(expandedText);
         var lookalike = SimpleFilters.FindAllRussianWordsWithLookalikeSymbolsInNormalizedText(normalized);
         if (lookalike.Count > 2)
         {
@@ -490,7 +491,7 @@ internal class MessageProcessor
         }
         _logger.LogDebug("Normalized:\n {Norm}", normalized);
         var (spam, score) = await _classifier.IsSpam(normalized);
-        if (score > 0.3)
+        if (score > Consts.ClassifierSpamScoreThreshold)
         {
             var reason = $"ML решил что это спам, скор {score}";
             if (score > 3 && _config.HighConfidenceAutoBan && !_config.MarketologsChats.Contains(chat.Id))
@@ -526,6 +527,21 @@ internal class MessageProcessor
             if (spamCheck.Probability >= Consts.LlmLowProbability)
             {
                 var reason = $"LLM думает что это спам {spamCheck.Probability * 100}%{Environment.NewLine}{spamCheck.Reason}";
+                if (
+                    score < Consts.ClassifierSpamScoreThreshold
+                    && spamCheck.Probability >= Consts.LlmHighProbability
+                    && _config.LowConfidenceHamForward
+                    && _config.NonFreeChat(chat.Id)
+                )
+                    await ForwardToFallbackAdmin(
+                        message,
+                        user,
+                        $"LLM считает сообщение спамом с высокой уверенностью ({spamCheck.Probability * 100}%), "
+                            + $"но классифаер пока не считает его спамом: скор {score}. "
+                            + $"Хорошая идея - добавить сообщение в датасет.{Environment.NewLine}"
+                            + $"Причина LLM: {spamCheck.Reason}",
+                        stoppingToken
+                    );
                 if (spamCheck.Probability >= Consts.LlmHighProbability && !_config.MarketologsChats.Contains(chat.Id))
                 {
                     await DeleteAndReportMessage(message, reason, stoppingToken);
@@ -535,18 +551,14 @@ internal class MessageProcessor
                 return CheckResult.Suspicious;
             }
         }
-
         if (score > -0.5 && _config.LowConfidenceHamForward && _config.NonFreeChat(chat.Id))
-        {
-            var forward = await _bot.ForwardMessage(_config.AdminChatId, chat.Id, message.MessageId, cancellationToken: stoppingToken);
-            var postLink = Utils.LinkToMessage(chat, message.MessageId);
-            await _bot.SendMessage(
-                _config.AdminChatId,
-                $"Классифаер думает что это НЕ спам, но конфиденс низкий: скор {score}. Хорошая идея - добавить сообщение в датасет.{Environment.NewLine}Юзер {Utils.FullName(user)} из чата {chat.Title}{Environment.NewLine}{postLink}",
-                replyParameters: forward,
-                cancellationToken: stoppingToken
+            await ForwardToFallbackAdmin(
+                message,
+                user,
+                $"Классифаер думает что это НЕ спам, но конфиденс низкий: скор {score}. " + "Хорошая идея - добавить сообщение в датасет.",
+                stoppingToken
             );
-        }
+
         if (!_config.NonFreeChat(chat.Id) && SimpleFilters.HasOnlyHelloWord(text))
         {
             await DontDeleteButReportMessage(message, "в этом сообщении написано привет и больше ничего, обычно это спамер", stoppingToken);
@@ -600,63 +612,22 @@ internal class MessageProcessor
 
     private async Task<CheckResult> HandleEmojiOnlyMessage(Message message, CancellationToken stoppingToken)
     {
-        if (await ChatHasReactionsDisabled(message.Chat.Id, stoppingToken))
-        {
-            await DeleteAndReportMessage(message, EmojiOnlyReactionsDisabledReason, stoppingToken);
-            return CheckResult.NoMoreAction;
-        }
-
-        Message? checkMessage;
+        bool confirmed;
         try
         {
-            checkMessage = await _bot.SendMessage(
-                message.Chat.Id,
-                EmojiOnlyCheckText,
-                replyParameters: message,
-                cancellationToken: stoppingToken
-            );
+            confirmed = await _captchaManager.ChallengeInChat(message, EmojiOnlyCheckPrompt, EmojiOnlyCheckWait, stoppingToken);
         }
         catch (Exception e) when (e is not OperationCanceledException)
         {
-            _logger.LogWarning(e, "Unable to send emoji-only check message");
-            await DeleteAndReportMessage(message, EmojiOnlyTimeoutReason, stoppingToken);
-            return CheckResult.NoMoreAction;
+            _logger.LogWarning(e, "Unable to send emoji-only captcha");
+            confirmed = false;
         }
-
-        var checkTask = _reactionHandler.RegisterEmojiOnlyCheck(message.Chat.Id, checkMessage.MessageId, message.From!.Id);
-        var completed = await Task.WhenAny(checkTask, Task.Delay(EmojiOnlyCheckWait, stoppingToken));
-        var confirmed = completed == checkTask && checkTask.IsCompletedSuccessfully;
-
-        _reactionHandler.FinishEmojiOnlyCheck(message.Chat.Id, checkMessage.MessageId);
-        await DeleteMessageSafe(message.Chat.Id, checkMessage.MessageId, stoppingToken);
 
         if (confirmed || stoppingToken.IsCancellationRequested)
             return CheckResult.NoMoreAction;
 
         await DeleteAndReportMessage(message, EmojiOnlyTimeoutReason, stoppingToken);
         return CheckResult.NoMoreAction;
-    }
-
-    private async ValueTask<bool> ChatHasReactionsDisabled(long chatId, CancellationToken stoppingToken)
-    {
-        try
-        {
-            return await _hybridCache.GetOrCreateAsync(
-                $"reactions_disabled:{chatId}",
-                async ct =>
-                {
-                    var chat = await _bot.GetChat(chatId, cancellationToken: ct);
-                    return chat.AvailableReactions is { Length: 0 };
-                },
-                new HybridCacheEntryOptions { LocalCacheExpiration = TimeSpan.FromMinutes(5) },
-                cancellationToken: stoppingToken
-            );
-        }
-        catch (Exception e) when (e is not OperationCanceledException)
-        {
-            _logger.LogWarning(e, "Unable to fetch chat info to detect reactions availability");
-            return false;
-        }
     }
 
     private async Task<CheckResult> CheckUserBio(Message message, User user, CancellationToken stoppingToken)
@@ -966,8 +937,8 @@ internal class MessageProcessor
         try
         {
             var nag = await _bot.SendMessage(chat.Id, NoRightsNag, replyParameters: message, cancellationToken: stoppingToken);
-            DeleteMessageLater(chat.Id, nag.MessageId, NagSelfDeleteAfter, stoppingToken)
-                .FireAndForget(_logger, nameof(DeleteMessageLater));
+            _bot.DeleteMessageLater(nag, NagSelfDeleteAfter, _logger, stoppingToken)
+                .FireAndForget(_logger, nameof(Utils.DeleteMessageLater));
         }
         catch (ApiRequestException e)
         {
@@ -1114,7 +1085,7 @@ internal class MessageProcessor
                 var user = newChatMember.User;
                 var messages = _recentMessagesStorage.Get(user.Id, chatMember.Chat.Id);
                 var lastMessage = messages.Count > 0 ? messages[^1] : null;
-                var lastMessageText = lastMessage?.Text ?? lastMessage?.Caption;
+                var lastMessageText = lastMessage == null ? null : Utils.TextWithLinks(lastMessage);
                 var tailMessage = string.IsNullOrWhiteSpace(lastMessageText)
                     ? "Если его забанили за спам, а ML не распознал спам - киньте его сообщение сюда."
                     : $"Его/её последним сообщением было:{Environment.NewLine}{lastMessageText}";
@@ -1129,6 +1100,19 @@ internal class MessageProcessor
                 StopWatchingNewcomer(key);
                 break;
         }
+    }
+
+    private async Task ForwardToFallbackAdmin(Message message, User user, string reason, CancellationToken stoppingToken)
+    {
+        var chat = message.Chat;
+        var forward = await _bot.ForwardMessage(_config.AdminChatId, chat.Id, message.MessageId, cancellationToken: stoppingToken);
+        var postLink = Utils.LinkToMessage(chat, message.MessageId);
+        await _bot.SendMessage(
+            _config.AdminChatId,
+            $"{reason}{Environment.NewLine}Юзер {Utils.FullName(user)} из чата {chat.Title}{Environment.NewLine}{postLink}",
+            replyParameters: forward,
+            cancellationToken: stoppingToken
+        );
     }
 
     private async Task DontDeleteButReportMessage(Message message, string? reason = null, CancellationToken stoppingToken = default)
@@ -1337,32 +1321,6 @@ internal class MessageProcessor
         {
             _logger.LogInformation(are, "Cannot send fallback message to admin chat");
             return null;
-        }
-    }
-
-    private async Task DeleteMessageLater(ChatId chatId, int messageId, TimeSpan delay, CancellationToken stoppingToken)
-    {
-        try
-        {
-            await Task.Delay(delay, stoppingToken);
-        }
-        catch (OperationCanceledException)
-        {
-            return;
-        }
-        await DeleteMessageSafe(chatId, messageId, stoppingToken);
-    }
-
-    private async Task DeleteMessageSafe(ChatId chatId, int messageId, CancellationToken stoppingToken)
-    {
-        try
-        {
-            await _bot.DeleteMessage(chatId, messageId, cancellationToken: stoppingToken);
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception e)
-        {
-            _logger.LogDebug(e, "Unable to delete message {MessageId} in chat {ChatId}", messageId, chatId);
         }
     }
 }
