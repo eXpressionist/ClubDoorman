@@ -340,7 +340,7 @@ internal class MessageProcessor
         using var logScopeName = _logger.BeginScope("User {Usr}", Utils.FullName(user));
         _recentMessagesStorage.Add(user.Id, chat.Id, message);
 
-        var contentResult = await CheckMessageContent(message, user, rawText ?? "", text, expandedText, chat, stoppingToken);
+        var contentResult = await CheckMessageContent(message, user, rawText ?? "", text, expandedText, chat, admChat, stoppingToken);
         if (contentResult == CheckResult.NoMoreAction)
             return;
 
