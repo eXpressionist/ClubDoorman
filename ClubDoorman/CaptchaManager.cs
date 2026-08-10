@@ -109,7 +109,7 @@ internal partial class CaptchaManager
         {
             var stats = _statistics.Stats.GetOrAdd(chat.Id, new Stats(chat.Title) { Id = chat.Id });
             stats.StoppedCaptcha++;
-            await _bot.BanChatMember(chat, answer.UserId, DateTime.UtcNow + TimeSpan.FromMinutes(10), revokeMessages: false);
+            await _bot.BanChatMember(chat, answer.UserId, DateTime.UtcNow + TimeSpan.FromMinutes(5), revokeMessages: false);
             UnbanUserLater(chat, answer.UserId);
         }
     }
@@ -300,12 +300,12 @@ internal partial class CaptchaManager
         foreach (var (key, info) in users)
         {
             var seconds = (now - info.Timestamp).TotalSeconds;
-            if (seconds > 45)
+            if (seconds > 60)
             {
                 var stats = _statistics.Stats.GetOrAdd(info.ChatId, new Stats(info.ChatTitle) { Id = info.ChatId });
                 stats.StoppedCaptcha++;
                 _captchaNeededUsers.TryRemove(key, out _);
-                await _bot.BanChatMember(info.ChatId, info.User.Id, now + TimeSpan.FromMinutes(20), revokeMessages: false);
+                await _bot.BanChatMember(info.ChatId, info.User.Id, now + TimeSpan.FromMinutes(10), revokeMessages: false);
                 UnbanUserLater(info.ChatId, info.User.Id);
             }
         }
