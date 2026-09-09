@@ -7,6 +7,7 @@ using Microsoft.Extensions.Caching.Hybrid;
 using Polly;
 using Polly.Retry;
 using Telegram.Bot;
+using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types;
 using tryAGI.OpenAI;
 
@@ -14,29 +15,64 @@ namespace ClubDoorman;
 
 internal class AiChecks
 {
-    public AiChecks(ITelegramBotClient bot, Config config, HybridCache hybridCache, UserManager userManager, ILogger<AiChecks> logger)
+    public AiChecks(
+        ITelegramBotClient bot,
+        Config config,
+        HybridCache hybridCache,
+        UserManager userManager,
+        ILogger<AiChecks> logger,
+        TelegramInvitePreviews invitePreviews
+    )
     {
         _bot = bot;
+        _profileInputCollector = new ProfileInputCollector(bot, logger, invitePreviews);
         _config = config;
         _hybridCache = hybridCache;
         _userManager = userManager;
 
         _logger = logger;
-        _api = _config.OpenRouterApi == null ? null : CustomProviders.OpenRouter(_config.OpenRouterApi);
+        _paid =
+            _config.OpenRouterApi == null
+                ? null
+                : new(CustomProviders.OpenRouter(_config.OpenRouterApi), PaidModel, PaidRetry, PaidProfileCacheLifetime);
+        var free = _config.FreeLlm;
+        // a local model answers in minutes, not seconds, and a free chat is never in a hurry: wait long, ask once
+        _free = free == null ? null : new(BuildFreeClient(free), free.Model, ResiliencePipeline.Empty, FreeProfileCacheLifetime);
     }
 
-    private readonly ResiliencePipeline _retry = new ResiliencePipelineBuilder()
+    private static readonly ResiliencePipeline PaidRetry = new ResiliencePipelineBuilder()
         .AddRetry(new RetryStrategyOptions() { Delay = TimeSpan.FromMilliseconds(50) })
         .Build();
-    const string Model = "google/gemini-3.5-flash-lite";
-    private readonly OpenAiClient? _api;
+    private static readonly TimeSpan PaidProfileCacheLifetime = TimeSpan.FromDays(7);
+    private static readonly TimeSpan FreeProfileCacheLifetime = TimeSpan.FromHours(12);
+    private static readonly TimeSpan FreeLlmTimeout = TimeSpan.FromMinutes(10);
+
+    internal static OpenAiClient BuildFreeClient(Config.FreeLlmSettings free)
+    {
+        var client = new OpenAiClient(
+            free.ApiKey,
+            new HttpClient(new FreeLlmRequestHandler()) { Timeout = FreeLlmTimeout },
+            baseUri: free.BaseUrl
+        );
+        // the SDK retries three times on its own, and a local model that is down or overloaded stays that way
+        client.Options.Retry = new AutoSDKRetryOptions { MaxAttempts = 1 };
+        return client;
+    }
+
+    const string PaidModel = "google/gemini-3.5-flash-lite";
+    private readonly LlmEndpoint? _paid;
+    private readonly LlmEndpoint? _free;
     private readonly JsonSerializerOptions jso = new() { Converters = { new JsonStringEnumConverter() } };
     private readonly ITelegramBotClient _bot;
+    private readonly ProfileInputCollector _profileInputCollector;
     private readonly Config _config;
     private readonly HybridCache _hybridCache;
     private readonly UserManager _userManager;
 
     private readonly ILogger<AiChecks> _logger;
+
+    /// <summary>Free chats go to their own endpoint, if one is configured; everyone else goes to the paid one.</summary>
+    private LlmEndpoint? EndpointFor(long chatId) => _config.NonFreeChat(chatId) ? _paid : _free;
 
     private const string ProfileSystemMessage =
         "Ты — модератор Telegram-группы. Твоя задача — по данным профиля определить, направлен ли аккаунт на само-продвижение или привлечение к сторонним платным/эротическим ресурсам";
@@ -67,13 +103,15 @@ internal class AiChecks
     private static string LinkedChannelInfoCacheKey(long channelId) => $"linked_channel_info:{channelId}";
 
     public async ValueTask<SpamPhotoBio> GetAttentionBaitProbability(
+        long chatId,
         Telegram.Bot.Types.User user,
         ChatFullInfo userChat,
         Func<string, ChatFullInfo, Task>? ifChanged = default,
         CancellationToken cancellationToken = default
     )
     {
-        if (_api == null)
+        var endpoint = EndpointFor(chatId);
+        if (endpoint == null)
             return NoBait;
         // whitelist is checked by user id, before the key: a content addressed key has nothing to overwrite
         if (await _userManager.IsHalfApproved(user.Id))
@@ -81,10 +119,10 @@ internal class AiChecks
 
         try
         {
-            var inputs = await CollectProfileInputs(user, userChat, cancellationToken);
+            var inputs = await _profileInputCollector.Collect(user, userChat, cancellationToken);
             var prompt = RenderProfilePrompt(inputs);
             return await _hybridCache.GetOrCreateAsync(
-                prompt.Key,
+                endpoint.CacheKey(prompt.Key),
                 async ct =>
                 {
                     SpamPhotoBio verdict;
@@ -96,7 +134,7 @@ internal class AiChecks
                     else
                     {
                         _logger.LogDebug("GetAttentionBaitProbability {User} cache miss, asking LLM", Utils.FullName(user));
-                        verdict = await AskProfileLlm(prompt, ct);
+                        verdict = await AskProfileLlm(prompt, endpoint, ct);
                     }
                     // the watcher starts only once there is a verdict to cache: the factory reruns on every message until
                     // it succeeds, so spawning above would leave one watcher per failed LLM call
@@ -104,105 +142,17 @@ internal class AiChecks
                         _ = CheckLater(userChat, ifChanged, ct);
                     return verdict;
                 },
-                new HybridCacheEntryOptions { LocalCacheExpiration = TimeSpan.FromDays(7) },
+                new HybridCacheEntryOptions { LocalCacheExpiration = endpoint.ProfileCacheLifetime },
                 cancellationToken: cancellationToken
             );
         }
-        catch (Exception e)
+        catch (Exception e) when (e is not OperationCanceledException)
         {
             // nothing is cached when the factory throws, so the next message retries instead of reusing a zero verdict
-            _logger.LogWarning(e, nameof(GetAttentionBaitProbability));
+            // an LLM endpoint is optional by design, so failing to reach one is routine and must not read as a fault
+            _logger.Log(e is HttpRequestException ? LogLevel.Information : LogLevel.Warning, e, nameof(GetAttentionBaitProbability));
             return NoBait;
         }
-    }
-
-    private async Task<ProfileInputs> CollectProfileInputs(
-        Telegram.Bot.Types.User user,
-        ChatFullInfo userChat,
-        CancellationToken ct = default
-    )
-    {
-        var avatar = userChat.Photo;
-        // identity comes from the chat, not from the message: the callback path re-checks a profile that has since been renamed
-        var fullName = Utils.FullName(userChat.FirstName ?? user.FirstName, userChat.LastName);
-        var userName = userChat.Username ?? user.Username;
-
-        PromptSection? linkedChannel = null;
-        var linked = userChat.LinkedChatId;
-        if (linked != null)
-        {
-            try
-            {
-                linkedChannel = ChannelSection("Информация о привязанном канале:", await _bot.GetChat(linked, cancellationToken: ct));
-            }
-            catch (Exception e) when (e is not OperationCanceledException)
-            {
-                // a private linked channel is a 400 on every message, and a null section would silently downgrade
-                // the whole check to the erotic-only branch, so say it out loud instead
-                _logger.LogWarning(e, "Unable to fetch linked channel {ChannelId}", linked);
-                linkedChannel = new PromptSection($"Информация о привязанном канале: недоступна (id {linked})", null, null);
-            }
-        }
-
-        var mentioned = new List<PromptSection>();
-        if (userChat.Bio != null)
-        {
-            var alreadyIncluded = new List<string>();
-            var matches = MyRegexes.TelegramUsername().Matches(userChat.Bio);
-            foreach (Match match in matches)
-            {
-                if (!match.Success)
-                    continue;
-                var relevantGroups = match
-                    .Groups.Cast<System.Text.RegularExpressions.Group>()
-                    .Skip(1) // 0th groups is full match
-                    .Where(g => g.Success);
-
-                foreach (System.Text.RegularExpressions.Group group in relevantGroups)
-                {
-                    var username = $"@{group.Value}";
-                    if (alreadyIncluded.Contains(username))
-                        continue;
-                    if (alreadyIncluded.Count >= 3)
-                        break;
-                    alreadyIncluded.Add(username);
-                    try
-                    {
-                        var mentionedChat = await _bot.GetChat(username, cancellationToken: ct);
-                        mentioned.Add(ChannelSection("Информация об упомянутом канале:", mentionedChat));
-                    }
-                    catch (Exception e)
-                    {
-                        // an unresolvable username is normal in a bio, the rest of the profile is still worth checking
-                        _logger.LogWarning(e, "Unable to fetch mentioned channel {Username}", username);
-                    }
-                }
-            }
-        }
-
-        return new ProfileInputs(
-            user.Id,
-            fullName,
-            userName,
-            userChat.Bio,
-            avatar?.BigFileUniqueId,
-            avatar?.BigFileId,
-            linkedChannel,
-            mentioned
-        );
-    }
-
-    private static PromptSection ChannelSection(string header, ChatFullInfo chat)
-    {
-        var info = new StringBuilder();
-        info.Append(CultureInfo.InvariantCulture, $"{header}\nНазвание: {chat.Title}");
-        if (chat.Username != null)
-            info.Append(CultureInfo.InvariantCulture, $"\nЮзернейм: @{chat.Username}");
-        if (chat.Description != null)
-            info.Append(CultureInfo.InvariantCulture, $"\nОписание: {chat.Description}");
-        if (chat.Photo != null)
-            info.Append("\nФото:");
-        return new PromptSection(info.ToString(), chat.Photo?.BigFileUniqueId, chat.Photo?.BigFileId);
     }
 
     internal static ProfilePrompt RenderProfilePrompt(ProfileInputs inputs)
@@ -232,8 +182,8 @@ internal class AiChecks
         }
 
         var keyMaterial = new StringBuilder();
-        keyMaterial.Append(inputs.UserId).Append('\n').Append(Model);
-        keyMaterial.Append('\n').Append(systemMessage);
+        // the model is not hashed in: the endpoint prefixes the key with its own model name
+        keyMaterial.Append(inputs.UserId).Append('\n').Append(systemMessage);
         foreach (var section in sections)
             keyMaterial.Append('\n').Append(section.Text).Append('\n').Append(section.PhotoUniqueId);
 
@@ -246,30 +196,12 @@ internal class AiChecks
         );
     }
 
-    private async ValueTask<SpamPhotoBio> AskProfileLlm(ProfilePrompt prompt, CancellationToken ct)
+    private async ValueTask<SpamPhotoBio> AskProfileLlm(ProfilePrompt prompt, LlmEndpoint endpoint, CancellationToken ct)
     {
-        var messages = new List<ChatCompletionRequestMessage>();
-        if (prompt.SystemMessage != null)
-            messages.Add(prompt.SystemMessage.AsSystemMessage());
-
-        var pic = Array.Empty<byte>();
-        for (var i = 0; i < prompt.Sections.Count; i++)
-        {
-            var section = prompt.Sections[i];
-            messages.Add(section.Text.AsUserMessage());
-            if (section.PhotoBigFileId == null)
-                continue;
-            using var ms = new MemoryStream();
-            await _bot.GetInfoAndDownloadFile(section.PhotoBigFileId, ms, cancellationToken: ct);
-            var photoBytes = ms.ToArray();
-            // section 0 is the user themselves, so its photo is the avatar, the rest are channel photos
-            if (i == 0)
-                pic = photoBytes;
-            messages.Add(CreateContextImageMessage(photoBytes));
-        }
+        var (messages, pic) = await BuildProfileMessages(prompt, _bot, ct);
         _logger.LogDebug("LLM prompt: {Prompt}", string.Join('\n', prompt.Sections.Select(x => x.Text)));
 
-        var probability = await AskProfileModel(prompt.EroticOnly, messages, ct);
+        var probability = await AskProfileModel(prompt.EroticOnly, messages, endpoint, ct);
         if (
             probability.EroticProbability < Consts.LlmLowProbability
             && probability.NonPersonProbability < Consts.LlmLowProbability
@@ -280,19 +212,52 @@ internal class AiChecks
         return new SpamPhotoBio(probability, pic, prompt.NameBio);
     }
 
+    internal static async Task<(List<ChatCompletionRequestMessage> Messages, byte[] Avatar)> BuildProfileMessages(
+        ProfilePrompt prompt,
+        ITelegramBotClient bot,
+        CancellationToken ct = default
+    )
+    {
+        var messages = new List<ChatCompletionRequestMessage>();
+        if (prompt.SystemMessage != null)
+            messages.Add(prompt.SystemMessage.AsSystemMessage());
+
+        var pic = Array.Empty<byte>();
+        for (var i = 0; i < prompt.Sections.Count; i++)
+        {
+            var section = prompt.Sections[i];
+            messages.Add(section.Text.AsUserMessage());
+            var photoBytes = section.PhotoBytes;
+            if (photoBytes == null)
+            {
+                if (section.PhotoBigFileId == null)
+                    continue;
+                using var ms = new MemoryStream();
+                await bot.GetInfoAndDownloadFile(section.PhotoBigFileId, ms, cancellationToken: ct);
+                photoBytes = ms.ToArray();
+            }
+            // section 0 is the user themselves, so its photo is the avatar, the rest are channel photos
+            if (i == 0)
+                pic = photoBytes;
+            messages.Add(CreateContextImageMessage(photoBytes, section.PhotoMimeType));
+        }
+        return (messages, pic);
+    }
+
     private async Task<BioClassProbability> AskProfileModel(
         bool eroticOnly,
         List<ChatCompletionRequestMessage> messages,
+        LlmEndpoint endpoint,
         CancellationToken ct
     )
     {
         if (eroticOnly)
         {
-            var erotic = await _retry.ExecuteAsync(
+            var erotic = await endpoint.Retry.ExecuteAsync(
                 async token =>
-                    await _api!.Chat.CreateChatCompletionAsAsync<SpamProbability>(
+                    await endpoint.Api.Chat.CreateChatCompletionAsAsync<SpamProbability>(
                         messages: messages,
-                        model: Model,
+                        model: endpoint.Model,
                         strict: true,
                         jsonSerializerOptions: jso,
                         cancellationToken: token
@@ -309,11 +274,11 @@ internal class AiChecks
             return probability;
         }
 
-        var response = await _retry.ExecuteAsync(
+        var response = await endpoint.Retry.ExecuteAsync(
             async token =>
-                await _api!.Chat.CreateChatCompletionAsAsync<BioClassProbability>(
+                await endpoint.Api.Chat.CreateChatCompletionAsAsync<BioClassProbability>(
                     messages: messages,
-                    model: Model,
+                    model: endpoint.Model,
                     strict: true,
                     jsonSerializerOptions: jso,
                     cancellationToken: token
@@ -445,7 +410,8 @@ internal class AiChecks
 
     public async ValueTask<SpamProbability> GetSpamProbability(Telegram.Bot.Types.Message message)
     {
-        if (_api == null)
+        var endpoint = EndpointFor(message.Chat.Id);
+        if (endpoint == null)
             return new SpamProbability();
 
         var text = Utils.TextWithLinks(message) ?? "";
@@ -477,15 +443,16 @@ internal class AiChecks
             );
 
             return await _hybridCache.GetOrCreateAsync(
-                prompt.Key,
-                async ct => await AskSpamLlm(prompt.Text, selectedPhoto, ct),
+                endpoint.CacheKey(prompt.Key),
+                async ct => await AskSpamLlm(prompt.Text, selectedPhoto, endpoint, ct),
                 new HybridCacheEntryOptions { LocalCacheExpiration = TimeSpan.FromDays(1) }
             );
         }
         catch (Exception e)
         {
             // nothing is cached when the factory throws, so the next identical message asks the model again
-            _logger.LogWarning(e, nameof(GetSpamProbability));
+            // an LLM endpoint is optional by design, so failing to reach one is routine and must not read as a fault
+            _logger.Log(e is HttpRequestException ? LogLevel.Information : LogLevel.Warning, e, nameof(GetSpamProbability));
             return new SpamProbability();
         }
     }
@@ -524,10 +491,10 @@ internal class AiChecks
 
         var promptText = fullPrompt.ToString();
         // the picture is part of the input but not of the text, so it has to be part of the key
-        return new SpamPrompt(promptText, $"llm_spam_prob:{ShaHelper.ComputeSha256Hex($"{Model}\n{promptText}\nPhoto: {photoUniqueId}")}");
+        return new SpamPrompt(promptText, $"llm_spam_prob:{ShaHelper.ComputeSha256Hex($"{promptText}\nPhoto: {photoUniqueId}")}");
     }
 
-    private async ValueTask<SpamProbability> AskSpamLlm(string prompt, PhotoSize? photo, CancellationToken ct)
+    private async ValueTask<SpamProbability> AskSpamLlm(string prompt, PhotoSize? photo, LlmEndpoint endpoint, CancellationToken ct)
     {
         byte[]? imageBytes = null;
         if (photo != null)
@@ -548,18 +515,18 @@ internal class AiChecks
             SpamSystemMessage,
             prompt,
             imageBytes != null,
-            Model
+            endpoint.Model
         );
 
         var messages = new List<ChatCompletionRequestMessage> { SpamSystemMessage.AsSystemMessage(), prompt.AsUserMessage() };
         if (imageBytes != null)
             messages.Add(CreateSpamImageMessage(imageBytes));
 
-        var response = await _retry.ExecuteAsync(
+        var response = await endpoint.Retry.ExecuteAsync(
             async token =>
-                await _api!.Chat.CreateChatCompletionAsAsync<SpamProbability>(
+                await endpoint.Api.Chat.CreateChatCompletionAsAsync<SpamProbability>(
                     messages: messages,
-                    model: Model,
+                    model: endpoint.Model,
                     strict: true,
                     jsonSerializerOptions: jso,
                     cancellationToken: token
@@ -575,8 +542,8 @@ internal class AiChecks
         return response.Value1;
     }
 
-    internal static ChatCompletionRequestUserMessage CreateContextImageMessage(byte[] imageBytes) =>
-        imageBytes.AsUserMessage(mimeType: "image/jpg", detail: ChatCompletionRequestMessageContentPartImageImageUrlDetail.Low)!;
+    internal static ChatCompletionRequestUserMessage CreateContextImageMessage(byte[] imageBytes, string mimeType = "image/jpeg") =>
+        imageBytes.AsUserMessage(mimeType: mimeType, detail: ChatCompletionRequestMessageContentPartImageImageUrlDetail.Low)!;
 
     internal static ChatCompletionRequestUserMessage CreateSpamImageMessage(byte[] imageBytes) =>
         imageBytes.AsUserMessage(mimeType: "image/jpg", detail: ChatCompletionRequestMessageContentPartImageImageUrlDetail.High)!;
@@ -619,7 +586,26 @@ internal class AiChecks
     );
 
     /// <summary>One user message and the photo that follows it, if any.</summary>
-    internal sealed record PromptSection(string Text, string? PhotoUniqueId, string? PhotoBigFileId);
+    internal sealed record PromptSection(string Text, string? PhotoUniqueId, string? PhotoBigFileId)
+    {
+        public byte[]? PhotoBytes { get; private init; }
+        public string PhotoMimeType { get; private init; } = "image/jpeg";
+
+        public static PromptSection FromInvite(TelegramInvitePreview preview)
+        {
+            var content = preview.Content ?? throw new ArgumentException("Invite preview has no content", nameof(preview));
+            var text =
+                $"Информация о группе/канале по приглашению https://t.me/+{preview.Hash}:"
+                + $"\nНазвание: {content.Title}\nОписание: {content.Description}";
+            if (content.Photo != null)
+                text += "\nФото:";
+            return new PromptSection(text, content.PhotoHash, null)
+            {
+                PhotoBytes = content.Photo,
+                PhotoMimeType = content.PhotoMimeType ?? "image/jpeg",
+            };
+        }
+    }
 
     internal sealed record ProfilePrompt(
         string? SystemMessage,
@@ -630,4 +616,105 @@ internal class AiChecks
     );
 
     internal sealed record SpamPrompt(string Text, string Key);
+
+    /// <summary>An OpenAI compatible endpoint together with the model to ask and profile cache lifetime. Cached verdicts are keyed per model.</summary>
+    private sealed record LlmEndpoint(OpenAiClient Api, string Model, ResiliencePipeline Retry, TimeSpan ProfileCacheLifetime)
+    {
+        public string CacheKey(string promptKey) => $"{promptKey}:{Model}";
+    }
+}
+
+internal sealed class ProfileInputCollector(ITelegramBotClient bot, ILogger<AiChecks> logger, TelegramInvitePreviews invitePreviews)
+{
+    public async Task<AiChecks.ProfileInputs> Collect(Telegram.Bot.Types.User user, ChatFullInfo userChat, CancellationToken ct = default)
+    {
+        var avatar = userChat.Photo;
+        // identity comes from the chat, not from the message: the callback path re-checks a profile that has since been renamed
+        var fullName = Utils.FullName(userChat.FirstName ?? user.FirstName, userChat.LastName);
+        var userName = userChat.Username ?? user.Username;
+
+        AiChecks.PromptSection? linkedChannel = null;
+        var linked = userChat.LinkedChatId;
+        if (linked != null)
+        {
+            try
+            {
+                linkedChannel = ChannelSection("Информация о привязанном канале:", await bot.GetChat(linked, cancellationToken: ct));
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                // a private linked channel is a 400 on every message, and a null section would silently downgrade
+                // the whole check to the erotic-only branch, so say it out loud instead
+                logger.LogWarning(e, "Unable to fetch linked channel {ChannelId}", linked);
+                linkedChannel = new AiChecks.PromptSection($"Информация о привязанном канале: недоступна (id {linked})", null, null);
+            }
+        }
+
+        var mentioned = new List<AiChecks.PromptSection>();
+        if (userChat.Bio != null)
+        {
+            var alreadyIncluded = new List<string>();
+            var matches = MyRegexes.TelegramUsername().Matches(userChat.Bio);
+            foreach (Match match in matches)
+            {
+                if (!match.Success)
+                    continue;
+                var relevantGroups = match
+                    .Groups.Cast<System.Text.RegularExpressions.Group>()
+                    .Skip(1) // 0th groups is full match
+                    .Where(g => g.Success);
+
+                foreach (System.Text.RegularExpressions.Group group in relevantGroups)
+                {
+                    var username = $"@{group.Value}";
+                    if (alreadyIncluded.Contains(username))
+                        continue;
+                    if (alreadyIncluded.Count >= 3)
+                        break;
+                    alreadyIncluded.Add(username);
+                    try
+                    {
+                        var mentionedChat = await bot.GetChat(username, cancellationToken: ct);
+                        mentioned.Add(ChannelSection("Информация об упомянутом канале:", mentionedChat));
+                    }
+                    catch (ApiRequestException e) when (e.ErrorCode == 400 && e.Message == "Bad Request: chat not found")
+                    {
+                        logger.LogInformation("Unable to fetch mentioned channel {Username}: chat not found", username);
+                    }
+                    catch (Exception e) when (e is not OperationCanceledException)
+                    {
+                        // one failed mention does not make the rest of the profile unusable
+                        logger.LogWarning(e, "Unable to fetch mentioned channel {Username}", username);
+                    }
+                }
+            }
+        }
+
+        var invites = await invitePreviews.GetFromBio(userChat.Bio, ct);
+        mentioned.AddRange(invites.Where(invite => invite.Content != null).Select(AiChecks.PromptSection.FromInvite));
+
+        return new AiChecks.ProfileInputs(
+            user.Id,
+            fullName,
+            userName,
+            userChat.Bio,
+            avatar?.BigFileUniqueId,
+            avatar?.BigFileId,
+            linkedChannel,
+            mentioned
+        );
+    }
+
+    private static AiChecks.PromptSection ChannelSection(string header, ChatFullInfo chat)
+    {
+        var info = new StringBuilder();
+        info.Append(CultureInfo.InvariantCulture, $"{header}\nНазвание: {chat.Title}");
+        if (chat.Username != null)
+            info.Append(CultureInfo.InvariantCulture, $"\nЮзернейм: @{chat.Username}");
+        if (chat.Description != null)
+            info.Append(CultureInfo.InvariantCulture, $"\nОписание: {chat.Description}");
+        if (chat.Photo != null)
+            info.Append("\nФото:");
+        return new AiChecks.PromptSection(info.ToString(), chat.Photo?.BigFileUniqueId, chat.Photo?.BigFileId);
+    }
 }

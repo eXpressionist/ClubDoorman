@@ -54,6 +54,10 @@ internal class MessageProcessor
     private readonly AiChecks _aiChecks;
     private readonly CaptchaManager _captchaManager;
     private readonly ConcurrentDictionary<long, int> _goodUserMessages = new();
+
+    // ponytail: never pruned, one entry per user who ever tripped a free chat check - swap for a sweeping cache
+    // if free chats ever grow enough for that to matter
+    private readonly ConcurrentDictionary<(long ChatId, long UserId), DateTime> _freeChatWarnedAt = new();
     private readonly StatisticsReporter _statistics;
     private readonly Config _config;
     private readonly ReactionHandler _reactionHandler;
@@ -62,6 +66,8 @@ internal class MessageProcessor
     private readonly ConcurrentDictionary<(long ChatId, long UserId), CancellationTokenSource> _newcomersOnWatch = new();
     private readonly HybridCache _hybridCache;
     private readonly SpamDeduplicationCache _spamDeduplicationCache;
+    private readonly BioInviteTracker _bioInviteTracker;
+    private readonly TelegramInvitePreviews _invitePreviews;
     private User? _me;
 
     public MessageProcessor(
@@ -78,7 +84,9 @@ internal class MessageProcessor
         AdminCommandHandler adminCommandHandler,
         RecentMessagesStorage recentMessagesStorage,
         HybridCache hybridCache,
-        SpamDeduplicationCache spamDeduplicationCache
+        SpamDeduplicationCache spamDeduplicationCache,
+        BioInviteTracker bioInviteTracker,
+        TelegramInvitePreviews invitePreviews
     )
     {
         _bot = bot;
@@ -95,6 +103,8 @@ internal class MessageProcessor
         _recentMessagesStorage = recentMessagesStorage;
         _hybridCache = hybridCache;
         _spamDeduplicationCache = spamDeduplicationCache;
+        _bioInviteTracker = bioInviteTracker;
+        _invitePreviews = invitePreviews;
     }
 
     public async Task HandleUpdate(Update update, CancellationToken stoppingToken)
@@ -348,6 +358,11 @@ internal class MessageProcessor
         if (bioResult == CheckResult.NoMoreAction)
             return;
 
+        // the message survived the ML check, so a free chat may now ask its own endpoint about it - without waiting,
+        // a local model takes minutes and all it can do afterwards is post a warning
+        if (_config.FreeLlmEnabled(chat.Id))
+            FreeChatLlmChecks(message, user, userChat, stoppingToken).FireAndForget(_logger, nameof(FreeChatLlmChecks));
+
         var profileResult = await CheckUserProfile(message, user, userChat, text, chat, admChat, stoppingToken);
         if (profileResult == CheckResult.NoMoreAction)
             return;
@@ -356,6 +371,7 @@ internal class MessageProcessor
             update.Message != null
             && update.EditedMessage == null
             && contentResult == CheckResult.Pass
+            && bioResult == CheckResult.Pass
             && profileResult == CheckResult.Pass
         )
         {
@@ -658,7 +674,20 @@ internal class MessageProcessor
             await AutoBan(message, "крипто-приватки в описании профиля", stoppingToken);
             return (CheckResult.NoMoreAction, userChat);
         }
-        return (CheckResult.Pass, userChat);
+        var invites = await _invitePreviews.GetFromBio(bio, stoppingToken);
+        var inviteResult = _bioInviteTracker.Observe(message, bio, invites);
+        try
+        {
+            await _bioInviteTracker.Report(
+                inviteResult,
+                warning => DontDeleteButReportMessage(warning.Message, warning.Reason, stoppingToken)
+            );
+        }
+        catch (Exception e) when (e is ApiRequestException or HttpRequestException)
+        {
+            _logger.LogWarning(e, "Unable to report shared bio invite warning");
+        }
+        return (inviteResult.IsShared ? CheckResult.Suspicious : CheckResult.Pass, userChat);
     }
 
     private async Task<CheckResult> CheckUserProfile(
@@ -680,6 +709,7 @@ internal class MessageProcessor
         var replyToRecentPost =
             message.ReplyToMessage?.IsAutomaticForward == true && DateTime.UtcNow - message.ReplyToMessage.Date < TimeSpan.FromMinutes(10);
         var (attention, photo, bio) = await _aiChecks.GetAttentionBaitProbability(
+            message.Chat.Id,
             message.From,
             userChat,
             async (x, changedChat) =>
@@ -692,6 +722,7 @@ internal class MessageProcessor
                 }
                 // changedChat is the snapshot the watcher just fetched, so the re-check sees the new profile
                 var (ascore, _, _) = await _aiChecks.GetAttentionBaitProbability(
+                    message.Chat.Id,
                     message.From,
                     changedChat,
                     cancellationToken: stoppingToken
@@ -859,6 +890,113 @@ internal class MessageProcessor
         }
 
         return CheckResult.Suspicious;
+    }
+
+    private static readonly TimeSpan FreeChatWarningLifetime = TimeSpan.FromMinutes(30);
+
+    private static readonly TimeSpan FreeChatWarningCooldown = TimeSpan.FromHours(12);
+
+    /// <summary>
+    /// The first warning about a user in a chat wins, the next one waits out twelve hours. Without this every later
+    /// message from the same user reposts the same warning: the profile verdict is cached in the free chat for twelve
+    /// hours, so the check stops asking the LLM during that period, and a burst of messages resolves it all at once.
+    /// </summary>
+    internal static bool TryClaimWarning(
+        ConcurrentDictionary<(long ChatId, long UserId), DateTime> warnedAt,
+        (long ChatId, long UserId) key,
+        DateTime now
+    ) => TryClaimWarning(warnedAt, key, now, FreeChatWarningCooldown);
+
+    internal static bool TryClaimWarning(
+        ConcurrentDictionary<(long ChatId, long UserId), DateTime> warnedAt,
+        (long ChatId, long UserId) key,
+        DateTime now,
+        TimeSpan cooldown
+    )
+    {
+        if (warnedAt.TryAdd(key, now))
+            return true;
+        if (!warnedAt.TryGetValue(key, out var last))
+            return warnedAt.TryAdd(key, now);
+        return now - last >= cooldown && warnedAt.TryUpdate(key, now, last);
+    }
+
+    internal static string BuildFreeChatWarning(string reason) =>
+        $"{reason}{Environment.NewLine}{Environment.NewLine}Проверки в базовом режиме выполняются легковесными моделями и могут содержать ошибки. Для более точного анализа переходите на PRO тариф.";
+
+    internal static string BuildFreeChatAdminReport(Chat chat, User user, int messageId, string reason)
+    {
+        var username = user.Username == null ? "" : $" @{user.Username}";
+        return $"Сработала LLM-проверка free-чата{Environment.NewLine}{reason}{Environment.NewLine}"
+            + $"Юзер {Utils.FullName(user)}{username} из чата {chat.Title}{Environment.NewLine}{Utils.LinkToMessage(chat, messageId)}";
+    }
+
+    /// <summary>
+    /// LLM checks for a free chat: a small local model is too dumb to ban or delete anything, so it only ever warns
+    /// the chat and reports to the fallback admin chat.
+    /// </summary>
+    private async Task FreeChatLlmChecks(Message message, User user, ChatFullInfo? userChat, CancellationToken stoppingToken)
+    {
+        if (userChat != null)
+        {
+            var (attention, _, _) = await _aiChecks.GetAttentionBaitProbability(
+                message.Chat.Id,
+                user,
+                userChat,
+                cancellationToken: stoppingToken
+            );
+            if (attention.EroticProbability >= Consts.LlmHighProbability)
+            {
+                await WarnFreeChat(message, user, $"Профиль с подозрением на эротику. {attention.Reason}", stoppingToken);
+                return;
+            }
+        }
+
+        var spamCheck = await _aiChecks.GetSpamProbability(message);
+        if (spamCheck.Probability >= Consts.LlmHighProbability)
+            await WarnFreeChat(message, user, $"Сообщение с подозрением на спам. {spamCheck.Reason}", stoppingToken);
+    }
+
+    private async Task WarnFreeChat(Message message, User user, string reason, CancellationToken stoppingToken)
+    {
+        var chat = message.Chat;
+        var warned = (chat.Id, user.Id);
+        if (!TryClaimWarning(_freeChatWarnedAt, warned, DateTime.UtcNow))
+        {
+            _logger.LogDebug("Free chat LLM warning: {User} was warned in {Chat} recently", Utils.FullName(user), chat.Title);
+            return;
+        }
+
+        // the report goes first and starts with the forward: a forward that fails means the message is already gone,
+        // and then there is nothing left to reply to
+        Message forward;
+        try
+        {
+            forward = await _bot.ForwardMessage(_config.AdminChatId, chat.Id, message.MessageId, cancellationToken: stoppingToken);
+        }
+        catch (ApiRequestException e)
+        {
+            // somebody else deleted the message, that is not a warning we got to spend: give the claim back
+            _freeChatWarnedAt.TryRemove(warned, out _);
+            _logger.LogInformation(e, "Free chat LLM warning: cannot forward the message, dropping the warning");
+            return;
+        }
+
+        await _bot.SendMessage(
+            _config.AdminChatId,
+            BuildFreeChatAdminReport(chat, user, message.MessageId, reason),
+            replyParameters: forward,
+            cancellationToken: stoppingToken
+        );
+
+        var warning = await _bot.SendMessage(
+            chat.Id,
+            BuildFreeChatWarning(reason),
+            replyParameters: message,
+            cancellationToken: stoppingToken
+        );
+        _bot.DeleteMessageLater(warning, FreeChatWarningLifetime, _logger, stoppingToken)
+            .FireAndForget(_logger, nameof(Utils.DeleteMessageLater));
     }
 
     private async Task HandleGoodUserCounter(Message message, User user, Chat chat, CancellationToken stoppingToken)

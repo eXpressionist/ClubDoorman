@@ -155,7 +155,7 @@ internal partial class CaptchaManager
                 chatId,
                 $"Привет, {Utils.FullName(user)}! Антиспам: на какой кнопке {Captcha.CaptchaList[correctAnswer].Description}? (Push a button with correct emoji or be kicked)",
                 replyMarkup: keyboard,
-                receiverUserId: user.Id
+                ephemeralMessageParameters: new EphemeralMessageParameters { ReceiverUserId = user.Id }
             );
             _bot.DeleteMessageLater(sent, TimeSpan.FromSeconds(45), _logger, captchaInfo.Cts.Token)
                 .FireAndForget(_logger, nameof(Utils.DeleteMessageLater));
@@ -210,7 +210,7 @@ internal partial class CaptchaManager
                 $"{prompt} Нажмите кнопку, на которой |Press a button with| {Captcha.CaptchaList[correctAnswer].Description}, у вас |you have| {wait.TotalSeconds:0} сек|sec|",
                 replyParameters: message,
                 replyMarkup: keyboard,
-                receiverUserId: user.Id,
+                ephemeralMessageParameters: new EphemeralMessageParameters { ReceiverUserId = user.Id },
                 cancellationToken: cancellationToken
             );
             var completed = await Task.WhenAny(challenge.Completion.Task, Task.Delay(wait, cancellationToken));
