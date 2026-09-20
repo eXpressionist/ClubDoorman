@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
@@ -23,13 +24,16 @@ public sealed class EroticProfileReviewTests
     private const long FreeChat = -1009876543210;
     private const long AdminChat = -1001111111111;
     private const string Lite = "google/gemini-3.5-flash-lite";
-    private const string Grok = "x-ai/grok-4.6:floor";
+    private const string Luna = "openai/gpt-5.6-luna:floor";
     private const string Gemini = "google/gemini-3.8-flash:floor";
     private static long _nextUserId = 1000;
     private readonly Dictionary<string, string?> _previousEnvironment = [];
     private readonly ConcurrentQueue<JsonElement> _llmRequests = new();
     private readonly List<(string Method, string Body)> _telegramRequests = [];
     private readonly Dictionary<string, double> _scores = [];
+    private double _gamblingScore;
+    private double _nonPersonScore;
+    private double _selfPromotionScore;
     private SqliteConnection _db = null!;
     private ServiceProvider _services = null!;
     private HttpClient _telegramHttp = null!;
@@ -65,8 +69,11 @@ public sealed class EroticProfileReviewTests
         _llmRequests.Clear();
         _telegramRequests.Clear();
         _scores[Lite] = 0.75;
-        _scores[Grok] = 0.85;
+        _scores[Luna] = 0.85;
         _scores[Gemini] = 0.85;
+        _gamblingScore = 0;
+        _nonPersonScore = 0;
+        _selfPromotionScore = 0;
         _failedModel = null;
         _reviewBarrier = null;
         _reviewsStarted = 0;
@@ -165,16 +172,16 @@ public sealed class EroticProfileReviewTests
     [TestCase(0.849, 1, false)]
     [TestCase(1, 0.849, false)]
     [TestCase(0.75, 0.75, false)]
-    public async Task BothReviewersMustReachReviewProbability(double grok, double gemini, bool confirmed)
+    public async Task BothReviewersMustReachReviewProbability(double luna, double gemini, bool confirmed)
     {
-        _scores[Grok] = grok;
+        _scores[Luna] = luna;
         _scores[Gemini] = gemini;
         var verdict = await Check();
         using (Assert.EnterMultipleScope())
         {
             Assert.That(verdict.Review, Is.Not.Null);
             Assert.That(verdict.Review!.Confirmed, Is.EqualTo(confirmed));
-            Assert.That(_llmRequests.Select(x => x.GetProperty("model").GetString()), Is.EquivalentTo(new[] { Lite, Grok, Gemini }));
+            Assert.That(_llmRequests.Select(x => x.GetProperty("model").GetString()), Is.EquivalentTo(new[] { Lite, Luna, Gemini }));
         }
     }
 
@@ -229,18 +236,56 @@ public sealed class EroticProfileReviewTests
         }
     }
 
+    [Test]
+    public async Task FreeProfileWithHighGamblingProbability_IsReportedWithoutModeration()
+    {
+        _scores[Lite] = 0;
+        _gamblingScore = 0.95;
+        _nonPersonScore = 0.9;
+        _selfPromotionScore = 0.2;
+        var message = new Message
+        {
+            Id = 123,
+            From = _user,
+            Chat = new Chat
+            {
+                Id = FreeChat,
+                Type = ChatType.Supergroup,
+                Title = "Free",
+            },
+            Text = "Hello",
+        };
+        using var cancellation = new CancellationTokenSource();
+        var method = typeof(MessageProcessor).GetMethod("FreeChatLlmChecks", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        await (Task)method.Invoke(_services.GetRequiredService<MessageProcessor>(), [message, _user, _profile, cancellation.Token])!;
+        await cancellation.CancelAsync();
+
+        var sentMessages = _telegramRequests.Where(x => x.Method == "sendMessage").ToArray();
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(_telegramRequests.Count(x => x.Method == "forwardMessage"), Is.EqualTo(1));
+            Assert.That(sentMessages, Has.Length.EqualTo(2));
+            Assert.That(sentMessages.Select(x => x.Body), Has.All.Contain($"Verdict from {Lite}"));
+            Assert.That(
+                _telegramRequests,
+                Has.None.Matches<(string Method, string Body)>(x => x.Method is "banChatMember" or "deleteMessage" or "restrictChatMember")
+            );
+        }
+    }
+
     [TestCase(0.85)]
     [TestCase(0.5)]
-    public async Task RepeatedProfileReusesAllVerdicts_ChangedProfileAsksAllModelsAgain(double grok)
+    public async Task RepeatedProfileReusesAllVerdicts_ChangedProfileAsksAllModelsAgain(double luna)
     {
-        _scores[Grok] = grok;
+        _scores[Luna] = luna;
         var first = await Check();
         var second = await Check();
         using (Assert.EnterMultipleScope())
         {
             Assert.That(_llmRequests, Has.Count.EqualTo(3));
             Assert.That(second.Review?.Confirmed, Is.EqualTo(first.Review!.Confirmed));
-            Assert.That(second.Review?.Grok.EroticProbability, Is.EqualTo(grok));
+            Assert.That(second.Review?.Luna.EroticProbability, Is.EqualTo(luna));
             Assert.That(second.Review?.Gemini.EroticProbability, Is.EqualTo(0.85));
             Assert.That(second.Review?.Reason, Is.EqualTo(first.Review.Reason));
         }
@@ -249,7 +294,7 @@ public sealed class EroticProfileReviewTests
         Assert.That(_llmRequests, Has.Count.EqualTo(6));
     }
 
-    [TestCase(Grok)]
+    [TestCase(Luna)]
     [TestCase(Gemini)]
     public async Task FailedReviewerPreservesInitialVerdict_AndRetriesNextTime(string failedModel)
     {
@@ -266,7 +311,7 @@ public sealed class EroticProfileReviewTests
         using (Assert.EnterMultipleScope())
         {
             Assert.That(retried.Review?.Confirmed, Is.True);
-            Assert.That(_llmRequests.Select(x => x.GetProperty("model").GetString()), Is.EquivalentTo(new[] { Grok, Gemini }));
+            Assert.That(_llmRequests.Select(x => x.GetProperty("model").GetString()), Is.EquivalentTo(new[] { Luna, Gemini }));
         }
     }
 
@@ -323,13 +368,13 @@ public sealed class EroticProfileReviewTests
     [TestCase(0.95, 0.849, false, true)]
     public async Task MessageProfileCheck_BansOnlyOnAgreement_OtherwiseKeepsExistingModeration(
         double lite,
-        double grok,
+        double luna,
         bool ban,
         bool restrict
     )
     {
         _scores[Lite] = lite;
-        _scores[Grok] = grok;
+        _scores[Luna] = luna;
         // Populate the same cache used by other profile consumers, without starting a profile watcher in this test.
         await Check();
         var message = new Message
@@ -351,7 +396,7 @@ public sealed class EroticProfileReviewTests
             if (ban)
             {
                 Assert.That(_telegramRequests.Single(x => x.Method == "banChatMember").Body, Does.Contain(_user.Id.ToString()));
-                Assert.That(_telegramRequests.Single(x => x.Method == "sendMessage").Body, Does.Contain(Grok).And.Contain(Gemini));
+                Assert.That(_telegramRequests.Single(x => x.Method == "sendMessage").Body, Does.Contain(Luna).And.Contain(Gemini));
                 Assert.That(_services.GetRequiredService<StatisticsReporter>().Stats[PaidChat].Autoban, Is.EqualTo(1));
             }
         }
@@ -381,7 +426,7 @@ public sealed class EroticProfileReviewTests
             Assert.That(_telegramRequests.Any(x => x.Method == "sendMessage"), Is.True);
             Assert.That(_telegramRequests.Any(x => x.Method == "deleteMessage"), Is.False);
             if (ban)
-                Assert.That(_telegramRequests.Single(x => x.Method == "sendMessage").Body, Does.Contain(Grok).And.Contain(Gemini));
+                Assert.That(_telegramRequests.Single(x => x.Method == "sendMessage").Body, Does.Contain(Luna).And.Contain(Gemini));
         }
     }
 
@@ -414,7 +459,14 @@ public sealed class EroticProfileReviewTests
         var content = eroticOnly
             ? JsonSerializer.Serialize(new AiChecks.SpamProbability { Probability = _scores[model], Reason = $"Verdict from {model}" })
             : JsonSerializer.Serialize(
-                new AiChecks.BioClassProbability { EroticProbability = _scores[model], Reason = $"Verdict from {model}" }
+                new AiChecks.BioClassProbability
+                {
+                    EroticProbability = _scores[model],
+                    GamblingProbability = _gamblingScore,
+                    NonPersonProbability = _nonPersonScore,
+                    SelfPromotionProbability = _selfPromotionScore,
+                    Reason = $"Verdict from {model}",
+                }
             );
         return JsonResponse(
             new

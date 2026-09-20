@@ -206,7 +206,7 @@ internal class MessageProcessor
         var user = message.From!;
         if (_userManager.Approved(user.Id))
         {
-            var approvedText = message.Text ?? message.Caption;
+            var approvedText = Utils.VisibleText(message);
             if (
                 _config.ApprovedUsersMlSpamCheck
                 && !string.IsNullOrWhiteSpace(approvedText)
@@ -340,7 +340,7 @@ internal class MessageProcessor
         }
 
         var quote = message.Quote?.Text != null ? $"> {message.Quote.Text}{Environment.NewLine}" : "";
-        var rawText = message.Text ?? message.Caption;
+        var rawText = Utils.VisibleText(message);
         var text = $"{quote}{rawText}";
         // hidden urls belong in the ML/LLM checks, but not in the shape heuristics or in the auto-ban and dedup keys,
         // which should still match a campaign that rotates its link per chat
@@ -529,12 +529,17 @@ internal class MessageProcessor
                     await DontDeleteButReportMessage(message, $"{reason}{Environment.NewLine}{spamCheck.Reason}", stoppingToken);
                     return CheckResult.Suspicious;
                 }
-                if (spamCheck.Probability >= Consts.LlmHighProbability)
+                var llmScore = $"{Environment.NewLine}LLM оценивает вероятность спама в {spamCheck.Probability * 100}%:";
+                if (score < Consts.ClassifierLlmOverrideScoreThreshold && spamCheck.IsAvailable && spamCheck.Probability <= 0.1)
                 {
-                    await AutoBan(message, $"{reason}{Environment.NewLine}{spamCheck.Reason}", stoppingToken);
+                    await DontDeleteButReportMessage(message, $"{reason}{llmScore}{Environment.NewLine}{spamCheck.Reason}", stoppingToken);
+                    return CheckResult.Suspicious;
+                }
+                if (ShouldAutoBanMlSpam(score, spamCheck.Probability))
+                {
+                    await AutoBan(message, $"{reason}{llmScore}{Environment.NewLine}{spamCheck.Reason}", stoppingToken);
                     return CheckResult.NoMoreAction;
                 }
-                var llmScore = $"{Environment.NewLine}LLM оценивает вероятность спама в {spamCheck.Probability * 100}%:";
                 await DeleteAndReportMessage(message, $"{reason}{llmScore}{Environment.NewLine}{spamCheck.Reason}", stoppingToken);
                 return CheckResult.NoMoreAction;
             }
@@ -956,6 +961,11 @@ internal class MessageProcessor
                 await WarnFreeChat(message, user, $"Профиль с подозрением на эротику. {attention.Reason}", stoppingToken);
                 return;
             }
+            if (attention.GamblingProbability >= Consts.LlmHighProbability)
+            {
+                await WarnFreeChat(message, user, $"Профиль с подозрением на быстрый заработок. {attention.Reason}", stoppingToken);
+                return;
+            }
         }
 
         var spamCheck = await _aiChecks.GetSpamProbability(message);
@@ -1028,6 +1038,9 @@ internal class MessageProcessor
             _goodUserMessages.TryRemove(user.Id, out _);
         }
     }
+
+    internal static bool ShouldAutoBanMlSpam(float score, double llmProbability) =>
+        llmProbability >= Consts.LlmHighProbability || (score > 1f && llmProbability >= 0.85);
 
     private async Task AutoBan(Message message, string reason, CancellationToken stoppingToken)
     {
