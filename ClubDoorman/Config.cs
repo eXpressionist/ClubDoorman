@@ -22,6 +22,7 @@ internal class Config
         EmojiCheckDisabledChats = GetChatsFromEnv("DOORMAN_CHANNELS_EMOJI_DISABLE");
         MarketologsChats = GetChatsFromEnv("DOORMAN_CHANNEL_MARKETOLOGY_EXCLUSION");
         CaptchaDisabledChats = GetChatsFromEnv("DOORMAN_CAPTCHA_DISABLE");
+        FreeLlmDisabledChats = GetChatsFromEnv("DOORMAN_FREE_LLM_DISABLE");
         IgnoreReportChannels = GetChatsFromEnv("DOORMAN_CHANNELS_IGNORE_REPORT");
 	StatisticsFallbackAdminChats = GetChatsFromEnv("DOORMAN_STATISTICS_FALLBACK_ADMIN_CHATS");
     }
@@ -54,15 +55,16 @@ internal class Config
     public FrozenSet<long> MarketologsChats { get; }
     public FrozenSet<long> CaptchaDisabledChats { get; }
     public FrozenSet<long> IgnoreReportChannels { get; }
+    public FrozenSet<long> FreeLlmDisabledChats { get; }
     public FrozenSet<long> StatisticsFallbackAdminChats { get; }
 
     public bool NonFreeChat(long chatId) => MultiAdminChatMap.Count == 0 || MultiAdminChatMap.ContainsKey(chatId);
 
-    // free chats do not pay for the bot, so they do not get to spend tokens either
+    // Paid moderation only; background dataset consensus uses Luna and Jev in all chats.
     public bool LlmEnabled(long chatId) => OpenRouterApi != null && NonFreeChat(chatId);
 
     // ...they get their own endpoint instead, if there is one: slow, dumb, and allowed to warn but never to ban
-    public bool FreeLlmEnabled(long chatId) => FreeLlm != null && !NonFreeChat(chatId);
+    public bool FreeLlmEnabled(long chatId) => FreeLlm != null && !NonFreeChat(chatId) && !FreeLlmDisabledChats.Contains(chatId);
 
     private FrozenSet<long> GetChatsFromEnv(string env)
     {

@@ -61,9 +61,10 @@ internal class AiChecks
         return client;
     }
 
-    const string PaidModel = "google/gemini-3.5-flash-lite";
-    private const string LunaReviewModel = "openai/gpt-5.6-luna:floor";
-    private const string GeminiReviewModel = "google/gemini-3.8-flash:floor";
+    const string PaidModel = "openai/gpt-6-luna:floor";
+    private const string MiMoReviewModel = "xiaomi/mimo-v2.6-flash:floor";
+    private const int MaxCompletionTokens = 2048;
+    private const string GlmReviewModel = "z-ai/glm-5.3-flash:floor";
     private readonly LlmEndpoint? _paid;
     private readonly LlmEndpoint? _free;
     private readonly JsonSerializerOptions jso = new() { Converters = { new JsonStringEnumConverter() } };
@@ -155,13 +156,13 @@ internal class AiChecks
             try
             {
                 var review = await _hybridCache.GetOrCreateAsync(
-                    $"{endpoint.CacheKey(prompt.Key)}:erotic-review:{LunaReviewModel}:{GeminiReviewModel}",
+                    $"{endpoint.CacheKey(prompt.Key)}:erotic-review:{MiMoReviewModel}:{GlmReviewModel}",
                     async ct =>
                     {
                         var (messages, _) = await BuildProfileMessages(prompt, _bot, ct);
                         var results = await Task.WhenAll(
-                            AskProfileModel(prompt.EroticOnly, messages, endpoint with { Model = LunaReviewModel }, ct),
-                            AskProfileModel(prompt.EroticOnly, messages, endpoint with { Model = GeminiReviewModel }, ct)
+                            AskProfileModel(prompt.EroticOnly, messages, endpoint with { Model = MiMoReviewModel }, ct),
+                            AskProfileModel(prompt.EroticOnly, messages, endpoint with { Model = GlmReviewModel }, ct)
                         );
                         return new EroticReview(results[0], results[1]);
                     },
@@ -291,6 +292,7 @@ internal class AiChecks
                         messages: messages,
                         model: endpoint.Model,
                         strict: true,
+                        maxCompletionTokens: MaxCompletionTokens,
                         jsonSerializerOptions: jso,
                         cancellationToken: token
                     ),
@@ -312,6 +314,7 @@ internal class AiChecks
                     messages: messages,
                     model: endpoint.Model,
                     strict: true,
+                    maxCompletionTokens: MaxCompletionTokens,
                     jsonSerializerOptions: jso,
                     cancellationToken: token
                 ),
@@ -446,50 +449,106 @@ internal class AiChecks
         if (endpoint == null)
             return new SpamProbability();
 
-        var text = Utils.TextWithLinks(message) ?? "";
-        if (message.Poll?.Question != null)
-            text =
-                $"Опрос: {message.Poll.Question}{Environment.NewLine}- {string.Join($"{Environment.NewLine}- ", message.Poll.Options.Select(o => o.Text))}";
-        if (message.Quote?.Text != null)
-            text = $"> {message.Quote.Text}{Environment.NewLine}{text}";
-
-        if (string.IsNullOrWhiteSpace(text) && message.Photo == null)
-        {
-            _logger.LogDebug("GetSpamProbability: No text or photo to analyze, returning 0");
-            return new SpamProbability();
-        }
-
-        var selectedPhoto = message.Photo is { Length: > 0 } ? SelectHighestQualityPhoto(message.Photo) : null;
-
         try
         {
-            var chatInfo = await GetChatInfoAsync(message.Chat.Id);
-            var linkedInfo = chatInfo?.ChannelId == null ? null : await GetLinkedChannelInfoAsync(chatInfo.ChannelId.Value);
-            var prompt = BuildSpamPrompt(
-                text,
-                chatInfo?.Description,
-                linkedInfo,
-                message.ReplyToMessage == null ? null : Utils.TextWithLinks(message.ReplyToMessage),
-                message.ReplyToMessage?.IsAutomaticForward == true,
-                selectedPhoto?.FileUniqueId
-            );
-
-            var probability = await _hybridCache.GetOrCreateAsync(
-                endpoint.CacheKey(prompt.Key),
-                async ct => await AskSpamLlm(prompt.Text, selectedPhoto, endpoint, ct),
-                new HybridCacheEntryOptions { LocalCacheExpiration = TimeSpan.FromDays(1) }
-            );
-            // Availability is not serialized, so mark successful verdicts after reading from the cache.
-            probability.IsAvailable = true;
-            return probability;
+            var input = await BuildSpamInput(message);
+            return input == null
+                ? new SpamProbability()
+                : await GetCachedSpamProbability(input.Value.Prompt, input.Value.Photo, endpoint, CancellationToken.None);
         }
         catch (Exception e)
         {
-            // nothing is cached when the factory throws, so the next identical message asks the model again
-            // an LLM endpoint is optional by design, so failing to reach one is routine and must not read as a fault
+            // Failed requests are not cached and must never look like a confident ham verdict.
             _logger.Log(e is HttpRequestException ? LogLevel.Information : LogLevel.Warning, e, nameof(GetSpamProbability));
             return new SpamProbability();
         }
+    }
+
+    internal async Task<SpamConsensus?> GetSpamConsensus(
+        Telegram.Bot.Types.Message message,
+        JevChecks jev,
+        Task<SpamProbability>? luna,
+        CancellationToken ct
+    )
+    {
+        if (_paid == null || !jev.Enabled)
+            return null;
+
+        var input = await BuildSpamInput(message, ct);
+        if (input == null)
+            return null;
+
+        var (prompt, photo) = input.Value;
+        var jevTask = jev.GetSpamProbability($"{SpamSystemMessage}\n\n{prompt.Text}", prompt.Key, ct);
+        // Always Luna, including free chats. Paid moderation supplies its in-flight task.
+        luna ??= GetCachedSpamProbability(prompt, photo, _paid, ct).AsTask();
+        await Task.WhenAll(luna, jevTask);
+        ct.ThrowIfCancellationRequested();
+        var lunaVerdict = await luna;
+        var jevVerdict = await jevTask;
+        if (
+            !lunaVerdict.IsAvailable
+            || !double.IsFinite(lunaVerdict.Probability)
+            || lunaVerdict.Probability is < 0 or > 1
+            || jevVerdict == null
+            || jevVerdict.Confidence < 0.8
+        )
+            return null;
+
+        // Compare P(spam) directly so the inclusive 0.2 ham boundary is exact.
+        if (jevVerdict.IsSpam ? lunaVerdict.Probability < 0.8 : lunaVerdict.Probability > 0.2)
+            return null;
+
+        return new SpamConsensus(
+            jevVerdict.IsSpam,
+            jevVerdict.IsSpam ? lunaVerdict.Probability : 1 - lunaVerdict.Probability,
+            jevVerdict.Confidence,
+            lunaVerdict.Reason
+        );
+    }
+
+    private async Task<(SpamPrompt Prompt, PhotoSize? Photo)?> BuildSpamInput(
+        Telegram.Bot.Types.Message message,
+        CancellationToken ct = default
+    )
+    {
+        var text = Utils.TextWithLinks(message) ?? "";
+        if (message.Quote?.Text != null)
+            text = $"> {message.Quote.Text}{Environment.NewLine}{text}";
+
+        var photo = message.Photo is { Length: > 0 } ? SelectHighestQualityPhoto(message.Photo) : null;
+        if (string.IsNullOrWhiteSpace(text) && photo == null)
+            return null;
+
+        var chatInfo = await GetChatInfoAsync(message.Chat.Id, ct);
+        var linkedInfo = chatInfo?.ChannelId == null ? null : await GetLinkedChannelInfoAsync(chatInfo.ChannelId.Value, ct);
+        var prompt = BuildSpamPrompt(
+            text,
+            chatInfo?.Description,
+            linkedInfo,
+            message.ReplyToMessage == null ? null : Utils.TextWithLinks(message.ReplyToMessage),
+            message.ReplyToMessage?.IsAutomaticForward == true,
+            photo?.FileUniqueId
+        );
+        return (prompt, photo);
+    }
+
+    private async ValueTask<SpamProbability> GetCachedSpamProbability(
+        SpamPrompt prompt,
+        PhotoSize? photo,
+        LlmEndpoint endpoint,
+        CancellationToken ct
+    )
+    {
+        var probability = await _hybridCache.GetOrCreateAsync(
+            endpoint.CacheKey(prompt.Key),
+            async token => await AskSpamLlm(prompt.Text, photo, endpoint, token),
+            new HybridCacheEntryOptions { LocalCacheExpiration = TimeSpan.FromDays(1) },
+            cancellationToken: ct
+        );
+        // Availability is not serialized, so mark successful verdicts after reading from the cache.
+        probability.IsAvailable = true;
+        return probability;
     }
 
     internal static SpamPrompt BuildSpamPrompt(
@@ -563,6 +622,7 @@ internal class AiChecks
                     messages: messages,
                     model: endpoint.Model,
                     strict: true,
+                    maxCompletionTokens: MaxCompletionTokens,
                     jsonSerializerOptions: jso,
                     cancellationToken: token
                 ),
@@ -573,6 +633,8 @@ internal class AiChecks
             _logger.LogWarning("LLM GetSpamProbability resp {@Resp}", response);
             throw new InvalidOperationException("LLM returned no parsed spam verdict");
         }
+        if (!double.IsFinite(response.Value1.Probability) || response.Value1.Probability is < 0 or > 1)
+            throw new JsonException("Invalid Luna spam probability");
         _logger.LogInformation("LLM GetSpamProbability {@Prob}", response.Value1);
         return response.Value1;
     }
@@ -593,12 +655,15 @@ internal class AiChecks
 
     internal class SpamProbability()
     {
+        [JsonRequired]
         public double Probability { get; set; }
         public string Reason { get; set; } = "";
 
         [JsonIgnore]
         public bool IsAvailable { get; set; }
     }
+
+    internal sealed record SpamConsensus(bool IsSpam, double LunaConfidence, double JevConfidence, string Reason);
 
     internal sealed class BioClassProbability()
     {
@@ -614,15 +679,15 @@ internal class AiChecks
         public EroticReview? Review { get; init; }
     }
 
-    internal sealed record EroticReview(BioClassProbability Luna, BioClassProbability Gemini)
+    internal sealed record EroticReview(BioClassProbability MiMo, BioClassProbability Glm)
     {
         public bool Confirmed =>
-            Luna.EroticProbability >= Consts.LlmEroticReviewProbability && Gemini.EroticProbability >= Consts.LlmEroticReviewProbability;
+            MiMo.EroticProbability >= Consts.LlmEroticReviewProbability && Glm.EroticProbability >= Consts.LlmEroticReviewProbability;
 
         public string Reason =>
             "Перепроверка эротического профиля:"
-            + $"\n{LunaReviewModel}: {Luna.EroticProbability:P0}. {Luna.Reason}"
-            + $"\n{GeminiReviewModel}: {Gemini.EroticProbability:P0}. {Gemini.Reason}";
+            + $"\n{MiMoReviewModel}: {MiMo.EroticProbability:P0}. {MiMo.Reason}"
+            + $"\n{GlmReviewModel}: {Glm.EroticProbability:P0}. {Glm.Reason}";
     }
 
     /// <summary>Everything the profile check takes from Telegram, already fetched. Channel sections arrive as ready made text.</summary>
