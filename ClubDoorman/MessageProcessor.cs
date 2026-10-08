@@ -216,22 +216,16 @@ internal class MessageProcessor
                 if (normalized.Length >= 10)
                 {
                     var (spam, score) = await _classifier.IsSpam(normalized);
-                    _ = StartDatasetReview(message, score, useModerationLuna: false, stoppingToken);
-                    if (spam && _config.NonFreeChat(chat.Id))
-                    {
-                        var fwd = await _bot.ForwardMessage(
-                            _config.AdminChatId,
-                            message.Chat,
-                            message.MessageId,
-                            cancellationToken: stoppingToken
-                        );
-                        await _bot.SendMessage(
-                            _config.AdminChatId,
-                            $"ML решил что это спам, скор {score}, но пользователь в доверенных. Возможно стоит добавить в ham, чат {chat.Title} {Utils.LinkToMessage(chat, message.MessageId)}",
-                            replyParameters: fwd,
-                            cancellationToken: stoppingToken
-                        );
-                    }
+                    var reportApprovedHam = spam && _config.NonFreeChat(chat.Id);
+                    var (_, datasetReviewStarted) = StartDatasetReview(
+                        message,
+                        score,
+                        useModerationLuna: false,
+                        stoppingToken,
+                        reportApprovedHam ? _ => ForwardApprovedUserHam(message, score, stoppingToken) : null
+                    );
+                    if (reportApprovedHam && !datasetReviewStarted)
+                        await ForwardApprovedUserHam(message, score, stoppingToken);
                 }
             }
             return;
@@ -511,11 +505,14 @@ internal class MessageProcessor
         }
         _logger.LogDebug("Normalized:\n {Norm}", normalized);
         var (spam, score) = await _classifier.IsSpam(normalized);
-        var luna = StartDatasetReview(
+        var lowConfidenceHam =
+            score is > -0.5f and <= Consts.ClassifierSpamScoreThreshold && _config.LowConfidenceHamForward && _config.NonFreeChat(chat.Id);
+        var (luna, datasetReviewStarted) = StartDatasetReview(
             message,
             score,
             _config.LlmEnabled(chat.Id) && (score > Consts.ClassifierSpamScoreThreshold || message.From != null),
-            stoppingToken
+            stoppingToken,
+            lowConfidenceHam ? spamCheck => ForwardManualDatasetReview(message, user, score, spamCheck, stoppingToken) : null
         );
         if (score > Consts.ClassifierSpamScoreThreshold)
         {
@@ -562,16 +559,9 @@ internal class MessageProcessor
                     score < Consts.ClassifierSpamScoreThreshold
                     && spamCheck.Probability >= Consts.LlmHighProbability
                     && _config.LowConfidenceHamForward
+                    && !datasetReviewStarted
                 )
-                    await ForwardToFallbackAdmin(
-                        message,
-                        user,
-                        $"LLM считает сообщение спамом с высокой уверенностью ({spamCheck.Probability * 100}%), "
-                            + $"но классифаер пока не считает его спамом: скор {score}. "
-                            + $"Хорошая идея - добавить сообщение в датасет.{Environment.NewLine}"
-                            + $"Причина LLM: {spamCheck.Reason}",
-                        stoppingToken
-                    );
+                    await ForwardHighConfidenceLlmSpam(message, user, score, spamCheck, stoppingToken);
                 if (spamCheck.Probability >= Consts.LlmHighProbability && !_config.MarketologsChats.Contains(chat.Id))
                 {
                     await DeleteAndReportMessage(message, reason, stoppingToken);
@@ -581,18 +571,13 @@ internal class MessageProcessor
                 return CheckResult.Suspicious;
             }
         }
-        if (score > -0.5 && _config.LowConfidenceHamForward && _config.NonFreeChat(chat.Id))
-            await ForwardToFallbackAdmin(
-                message,
-                user,
-                $"Классифаер думает что это НЕ спам, но конфиденс низкий: скор {score}. " + "Хорошая идея - добавить сообщение в датасет.",
-                stoppingToken
-            );
+        if (lowConfidenceHam && !datasetReviewStarted)
+            await ForwardLowConfidenceHam(message, user, score, stoppingToken);
 
-        if (!_config.NonFreeChat(chat.Id) && SimpleFilters.HasOnlyHelloWord(text))
+        if (SimpleFilters.HasOnlyHelloWord(text))
         {
-            await DontDeleteButReportMessage(message, "в этом сообщении написано привет и больше ничего, обычно это спамер", stoppingToken);
-            return CheckResult.Suspicious;
+            await DeleteAndReportMessage(message, "в этом сообщении написано привет и больше ничего, обычно это спамер", stoppingToken);
+            return CheckResult.NoMoreAction;
         }
 
         _logger.LogDebug("Classifier thinks its ham, score {Score}", score);
@@ -640,23 +625,95 @@ internal class MessageProcessor
         return CheckResult.Pass;
     }
 
-    private Task<AiChecks.SpamProbability>? StartDatasetReview(
+    private (Task<AiChecks.SpamProbability>? Luna, bool Started) StartDatasetReview(
         Message message,
         float score,
         bool useModerationLuna,
-        CancellationToken stoppingToken
+        CancellationToken stoppingToken,
+        Func<AiChecks.SpamProbability?, Task>? onNoConsensus = null
     )
     {
         if (!(score is > -0.5f and < 0.5f) || !_jevChecks.Enabled)
-            return null;
+            return (null, false);
 
         var luna = useModerationLuna ? _aiChecks.GetSpamProbability(message).AsTask() : null;
-        Task.Run(() => AddConsensusExample(message, score, luna, stoppingToken), stoppingToken)
+        Task.Run(
+                async () =>
+                {
+                    try
+                    {
+                        var added = await AddConsensusExample(message, score, luna, stoppingToken);
+                        if (!added && !stoppingToken.IsCancellationRequested && onNoConsensus != null)
+                            await onNoConsensus(luna == null ? null : await luna);
+                    }
+                    finally
+                    {
+                        _logger.LogDebug(
+                            "Spam/ham dataset review finished for chat {ChatId} message {MessageId}",
+                            message.Chat.Id,
+                            message.Id
+                        );
+                    }
+                },
+                stoppingToken
+            )
             .FireAndForget(_logger, "Background spam/ham dataset review failed");
-        return luna;
+        return (luna, true);
     }
 
-    private async Task AddConsensusExample(
+    private async Task ForwardApprovedUserHam(Message message, float score, CancellationToken stoppingToken)
+    {
+        var chat = message.Chat;
+        var forward = await _bot.ForwardMessage(_config.AdminChatId, chat, message.MessageId, cancellationToken: stoppingToken);
+        await _bot.SendMessage(
+            _config.AdminChatId,
+            $"ML решил что это спам, скор {score}, но пользователь в доверенных. Возможно стоит добавить в ham, чат {chat.Title} {Utils.LinkToMessage(chat, message.MessageId)}",
+            replyParameters: forward,
+            cancellationToken: stoppingToken
+        );
+    }
+
+    private Task ForwardManualDatasetReview(
+        Message message,
+        User user,
+        float score,
+        AiChecks.SpamProbability? spamCheck,
+        CancellationToken stoppingToken
+    )
+    {
+        if (spamCheck == null || spamCheck.Probability < Consts.LlmLowProbability)
+            return ForwardLowConfidenceHam(message, user, score, stoppingToken);
+        if (score < Consts.ClassifierSpamScoreThreshold && spamCheck.Probability >= Consts.LlmHighProbability)
+            return ForwardHighConfidenceLlmSpam(message, user, score, spamCheck, stoppingToken);
+        return Task.CompletedTask;
+    }
+
+    private Task ForwardLowConfidenceHam(Message message, User user, float score, CancellationToken stoppingToken) =>
+        ForwardToFallbackAdmin(
+            message,
+            user,
+            $"Классифаер думает что это НЕ спам, но конфиденс низкий: скор {score}. " + "Хорошая идея - добавить сообщение в датасет.",
+            stoppingToken
+        );
+
+    private Task ForwardHighConfidenceLlmSpam(
+        Message message,
+        User user,
+        float score,
+        AiChecks.SpamProbability spamCheck,
+        CancellationToken stoppingToken
+    ) =>
+        ForwardToFallbackAdmin(
+            message,
+            user,
+            $"LLM считает сообщение спамом с высокой уверенностью ({spamCheck.Probability * 100}%), "
+                + $"но классифаер пока не считает его спамом: скор {score}. "
+                + $"Хорошая идея - добавить сообщение в датасет.{Environment.NewLine}"
+                + $"Причина LLM: {spamCheck.Reason}",
+            stoppingToken
+        );
+
+    private async Task<bool> AddConsensusExample(
         Message message,
         float score,
         Task<AiChecks.SpamProbability>? luna,
@@ -667,23 +724,21 @@ internal class MessageProcessor
         {
             var consensus = await _aiChecks.GetSpamConsensus(message, _jevChecks, luna, stoppingToken);
             if (consensus == null)
-                return;
+                return false;
 
             var label = consensus.IsSpam ? "spam" : "ham";
             var reason =
                 $"ML score: {score}; Jev: {label} {consensus.JevConfidence:P1}; Luna: {label} {consensus.LunaConfidence:P1}."
                 + $"\nПричина Luna: {consensus.Reason}";
             await _adminCommandHandler.AddAutomaticExample(message, consensus.IsSpam, reason, stoppingToken);
+            return true;
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
         catch (Exception e)
         {
             _logger.LogWarning(e, "Spam/ham dataset review failed for chat {ChatId} message {MessageId}", message.Chat.Id, message.Id);
         }
-        finally
-        {
-            _logger.LogDebug("Spam/ham dataset review finished for chat {ChatId} message {MessageId}", message.Chat.Id, message.Id);
-        }
+        return false;
     }
 
     private async Task<CheckResult> HandleEmojiOnlyMessage(Message message, CancellationToken stoppingToken)
@@ -728,6 +783,11 @@ internal class MessageProcessor
         if (MyRegexes.CryptoPrivatkiBio().IsMatch(bio))
         {
             await AutoBan(message, "крипто-приватки в описании профиля", stoppingToken);
+            return (CheckResult.NoMoreAction, userChat);
+        }
+        if (MyRegexes.BlacklistedBioMention().IsMatch(bio))
+        {
+            await AutoBan(message, "запрещённое упоминание в описании профиля", stoppingToken);
             return (CheckResult.NoMoreAction, userChat);
         }
         var invites = await _invitePreviews.GetFromBio(bio, stoppingToken);
@@ -1331,7 +1391,7 @@ internal class MessageProcessor
     private async Task ForwardToFallbackAdmin(Message message, User user, string reason, CancellationToken stoppingToken)
     {
         var chat = message.Chat;
-        var forward = await _bot.ForwardMessage(_config.AdminChatId, chat.Id, message.MessageId, cancellationToken: stoppingToken);
+        var forward = await ForwardOrSendAdminFallback(_config.AdminChatId, message, stoppingToken);
         var postLink = Utils.LinkToMessage(chat, message.MessageId);
         await _bot.SendMessage(
             _config.AdminChatId,
@@ -1349,7 +1409,8 @@ internal class MessageProcessor
         var fromChat = message.SenderChat;
         var user = message.From!;
         var admChat = _config.GetAdminChat(message.Chat.Id);
-        var forward = await ForwardOrSendAdminFallback(admChat, message, stoppingToken);
+        if (await ForwardUndeletedOrSendAdminFallback(admChat, message, stoppingToken) is not { } forward)
+            return;
         var callbackData = fromChat == null ? $"ban_{message.Chat.Id}_{user.Id}" : $"banchan_{message.Chat.Id}_{fromChat.Id}";
 
         var postLink = Utils.LinkToMessage(message.Chat, message.MessageId);
@@ -1364,7 +1425,7 @@ internal class MessageProcessor
         await _bot.SendMessage(
             admChat,
             $"Сообщение НЕ удалено{editedMessageNote}{Environment.NewLine}{msg}{Environment.NewLine}Юзер {Utils.FullName(user)} из чата {message.Chat.Title}{Environment.NewLine}{postLink}{reply}",
-            replyParameters: forward,
+            replyParameters: forward.Message,
             replyMarkup: new InlineKeyboardMarkup(
                 new InlineKeyboardButton(Consts.BanButton) { CallbackData = callbackData },
                 new InlineKeyboardButton(Consts.OkButton) { CallbackData = "noop" }
@@ -1383,7 +1444,8 @@ internal class MessageProcessor
         _logger.LogDebug("DontDeleteButReportMessageWithApprove");
         var user = message.From!;
         var admChat = _config.GetAdminChat(message.Chat.Id);
-        var forward = await ForwardOrSendAdminFallback(admChat, message, stoppingToken);
+        if (await ForwardUndeletedOrSendAdminFallback(admChat, message, stoppingToken) is not { } forward)
+            return;
 
         var postLink = Utils.LinkToMessage(message.Chat, message.MessageId);
         var reply = "";
@@ -1396,7 +1458,7 @@ internal class MessageProcessor
         await _bot.SendMessage(
             admChat,
             $"Сообщение НЕ удалено{Environment.NewLine}{msg}{Environment.NewLine}Юзер {Utils.FullName(user)} из чата {message.Chat.Title}{Environment.NewLine}{postLink}{reply}",
-            replyParameters: forward,
+            replyParameters: forward.Message,
             replyMarkup: new InlineKeyboardMarkup(
                 new InlineKeyboardButton(Consts.BanButton) { CallbackData = $"banNoMark_{message.Chat.Id}_{user.Id}" },
                 new InlineKeyboardButton(Consts.OkButton) { CallbackData = $"attOk_{userId}" },
@@ -1506,6 +1568,36 @@ internal class MessageProcessor
         return null;
     }
 
+    private sealed record AdminForward(Message? Message);
+
+    /// <summary>
+    /// Like <see cref="ForwardOrSendAdminFallback"/>, but returns null when the message is already gone from the chat
+    /// (e.g. deleted by its author or another bot while we waited for the LLM), so there is nothing left to report.
+    /// </summary>
+    private async Task<AdminForward?> ForwardUndeletedOrSendAdminFallback(ChatId admChat, Message message, CancellationToken stoppingToken)
+    {
+        try
+        {
+            return new AdminForward(
+                await _bot.ForwardMessage(admChat, message.Chat.Id, message.MessageId, cancellationToken: stoppingToken)
+            );
+        }
+        catch (ApiRequestException are) when (IsMessageGone(are))
+        {
+            _logger.LogInformation("Message is already deleted from the chat, not reporting it");
+            return null;
+        }
+        catch (ApiRequestException are)
+        {
+            _logger.LogInformation(are, "Cannot forward");
+        }
+
+        return new AdminForward(await SendAdminFallback(admChat, message, stoppingToken));
+    }
+
+    private static bool IsMessageGone(ApiRequestException e) =>
+        e.Message is "Bad Request: message to forward not found" or "Bad Request: MESSAGE_ID_INVALID";
+
     private async Task<Message?> ForwardOrSendAdminFallback(ChatId admChat, Message message, CancellationToken stoppingToken)
     {
         try
@@ -1517,6 +1609,11 @@ internal class MessageProcessor
             _logger.LogInformation(are, "Cannot forward");
         }
 
+        return await SendAdminFallback(admChat, message, stoppingToken);
+    }
+
+    private async Task<Message?> SendAdminFallback(ChatId admChat, Message message, CancellationToken stoppingToken)
+    {
         var fallback = BuildAdminForwardFallbackMessage(message);
         if (fallback == null)
         {

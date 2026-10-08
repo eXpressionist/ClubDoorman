@@ -26,6 +26,31 @@ public sealed class MessageProcessorMlOverrideTests
     private const long FreeChat = -1009876543210;
     private const long AdminChat = -1001111111111;
 
+    [TestCase(PaidChat, "Hi")]
+    [TestCase(FreeChat, "Hi")]
+    [TestCase(PaidChat, "привет")]
+    [TestCase(FreeChat, "привет")]
+    public async Task GreetingUpdate_DeletesAndRestricts_WithStandardReporting(long chatId, string text)
+    {
+        await using var fixture = await Fixture.Create(score: -1f, llmProbability: 0.0, llmAvailable: true);
+
+        await fixture.CheckTextUpdate(chatId, text);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(fixture.Requests.Count(x => x.Method == "deleteMessage"), Is.EqualTo(1));
+            Assert.That(fixture.Requests.Count(x => x.Method == "restrictChatMember"), Is.EqualTo(1));
+            Assert.That(fixture.Requests.Select(x => x.Method), Does.Not.Contain("banChatMember"));
+            Assert.That(fixture.Requests.Count(x => x.Method == "forwardMessage"), Is.EqualTo(chatId == PaidChat ? 1 : 0));
+            Assert.That(fixture.Requests.Count(x => x.Method == "sendMessage"), Is.EqualTo(chatId == PaidChat ? 1 : 0));
+        }
+        if (chatId == PaidChat)
+        {
+            using var report = JsonDocument.Parse(fixture.Requests.Single(x => x.Method == "sendMessage").Body);
+            Assert.That(report.RootElement.GetProperty("text").GetString(), Does.Contain("в этом сообщении написано привет"));
+        }
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public async Task PollUpdate_UsesSpamChecksInsteadOfEmptyTextReport(bool edited)
@@ -96,6 +121,43 @@ public sealed class MessageProcessorMlOverrideTests
         }
     }
 
+    [TestCase("Bad Request: message to forward not found")]
+    [TestCase("Bad Request: MESSAGE_ID_INVALID")]
+    public async Task PaidReportOnly_MessageAlreadyDeletedFromChat_IsNotReported(string forwardError)
+    {
+        await using var fixture = await Fixture.Create(score: 0.5f, llmProbability: 0.1, llmAvailable: true, forwardError: forwardError);
+
+        var result = await fixture.Check(PaidChat);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(result, Is.EqualTo(CheckResult.Suspicious));
+            Assert.That(fixture.Requests.Count(x => x.Method == "forwardMessage"), Is.EqualTo(1));
+            Assert.That(fixture.Requests.Select(x => x.Method), Has.None.StartsWith("send"));
+            Assert.That(fixture.Requests.Select(x => x.Method), Does.Not.Contain("deleteMessage"));
+        }
+    }
+
+    [Test]
+    public async Task PaidReportOnly_ForwardFailsForOtherReason_SendsFallbackAndReport()
+    {
+        await using var fixture = await Fixture.Create(
+            score: 0.5f,
+            llmProbability: 0.1,
+            llmAvailable: true,
+            forwardError: "Bad Request: message can't be forwarded"
+        );
+
+        var result = await fixture.Check(PaidChat);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(result, Is.EqualTo(CheckResult.Suspicious));
+            Assert.That(fixture.Requests.Count(x => x.Method == "sendMessage"), Is.EqualTo(2));
+            Assert.That(fixture.Requests.Select(x => x.Method), Does.Not.Contain("deleteMessage"));
+        }
+    }
+
     [Test]
     public async Task PaidChatUnavailableLlm_DefaultZeroDoesNotLookLikeAvailableLowScore()
     {
@@ -140,10 +202,10 @@ public sealed class MessageProcessorMlOverrideTests
         }
     }
 
-    [TestCase(PaidChat, 0.8, "spam", 0.8, true)]
-    [TestCase(FreeChat, 0.8, "spam", 0.8, true)]
-    [TestCase(PaidChat, 0.2, "not_spam", 0.8, false)]
-    [TestCase(FreeChat, 0.2, "not_spam", 0.8, false)]
+    [TestCase(PaidChat, 0.9, "spam", 0.9, true)]
+    [TestCase(FreeChat, 0.9, "spam", 0.9, true)]
+    [TestCase(PaidChat, 0.1, "not_spam", 0.9, false)]
+    [TestCase(FreeChat, 0.1, "not_spam", 0.9, false)]
     public async Task AmbiguousMl_ConfidentAgreement_LearnsInEveryChat(
         long chatId,
         double lunaProbability,
@@ -166,6 +228,235 @@ public sealed class MessageProcessorMlOverrideTests
         }
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task LowConfidenceHam_ConfidentAgreement_DoesNotRequestManualDatasetReview(bool delayJev)
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var fixture = await Fixture.Create(
+            -0.3917967f,
+            0.01,
+            true,
+            "not_spam",
+            1,
+            jevRelease: delayJev ? release.Task : null,
+            lowConfidenceHamForward: true
+        );
+
+        try
+        {
+            var result = await fixture.Check(PaidChat).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.That(result, Is.EqualTo(CheckResult.Pass));
+            if (delayJev)
+            {
+                using (Assert.EnterMultipleScope())
+                {
+                    Assert.That(fixture.ReviewCompleted.Task.IsCompleted, Is.False);
+                    Assert.That(fixture.Requests.Where(x => x.Method is "forwardMessage" or "sendMessage"), Is.Empty);
+                }
+            }
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        await fixture.ReviewCompleted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That((await fixture.Records()).Single().IsSpam, Is.False);
+            Assert.That(fixture.Requests.Count(x => x.Method == "forwardMessage"), Is.EqualTo(1));
+            Assert.That(fixture.Requests.Count(x => x.Method == "sendMessage"), Is.EqualTo(1));
+            Assert.That(RequestText(fixture.Requests.Single(x => x.Method == "sendMessage")), Does.Not.Contain("конфиденс низкий"));
+        }
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task HighConfidenceLlmSpam_ConfidentAgreement_DoesNotRequestManualDatasetReview(bool delayJev)
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var fixture = await Fixture.Create(
+            0.0042500496f,
+            0.99,
+            true,
+            "spam",
+            0.95,
+            jevRelease: delayJev ? release.Task : null,
+            lowConfidenceHamForward: true
+        );
+
+        try
+        {
+            var result = await fixture.Check(PaidChat).WaitAsync(TimeSpan.FromSeconds(5));
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(result, Is.EqualTo(CheckResult.NoMoreAction));
+                Assert.That(fixture.Requests.Select(x => x.Method), Does.Contain("deleteMessage"));
+                Assert.That(
+                    fixture.Requests.Where(x => x.Method == "sendMessage").Select(RequestText),
+                    Has.None.Contains("Хорошая идея - добавить сообщение в датасет")
+                );
+                if (delayJev)
+                    Assert.That(fixture.ReviewCompleted.Task.IsCompleted, Is.False);
+            }
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        await fixture.ReviewCompleted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That((await fixture.Records()).Single().IsSpam, Is.True);
+            Assert.That(fixture.Requests.Count(x => x.Method == "sendMessage"), Is.EqualTo(2));
+            Assert.That(
+                fixture.Requests.Where(x => x.Method == "sendMessage").Select(RequestText),
+                Has.None.Contains("Хорошая идея - добавить сообщение в датасет")
+            );
+            Assert.That(fixture.LlmRequests, Has.Count.EqualTo(1));
+        }
+    }
+
+    [TestCase("not_spam", 0.95)]
+    [TestCase(null, 0.95)]
+    [TestCase("spam", 0.89)]
+    public async Task HighConfidenceLlmSpam_WithoutConsensus_RequestsManualDatasetReviewAfterDeletion(
+        string? jevLabel,
+        double jevConfidence
+    )
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var fixture = await Fixture.Create(
+            0.0042500496f,
+            0.99,
+            true,
+            jevLabel,
+            jevConfidence,
+            jevRelease: release.Task,
+            lowConfidenceHamForward: true,
+            failForwardAfterDeletion: true
+        );
+
+        try
+        {
+            var result = await fixture.Check(PaidChat).WaitAsync(TimeSpan.FromSeconds(5));
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(result, Is.EqualTo(CheckResult.NoMoreAction));
+                Assert.That(fixture.Requests.Select(x => x.Method), Does.Contain("deleteMessage"));
+                Assert.That(fixture.ReviewCompleted.Task.IsCompleted, Is.False);
+                Assert.That(
+                    fixture.Requests.Where(x => x.Method == "sendMessage").Select(RequestText),
+                    Has.None.Contains("Хорошая идея - добавить сообщение в датасет")
+                );
+            }
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        await fixture.ReviewCompleted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        var reports = fixture.Requests.Where(x => x.Method == "sendMessage").Select(RequestText).ToArray();
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(await fixture.Records(), Is.Empty);
+            Assert.That(reports, Has.Length.EqualTo(3));
+            Assert.That(reports, Does.Contain("ordinary message with enough text"));
+            Assert.That(reports, Has.Exactly(1).Contains("LLM считает сообщение спамом с высокой уверенностью"));
+            Assert.That(reports, Has.None.Contains("конфиденс низкий"));
+        }
+    }
+
+    [TestCase(-0.5f, true, 2)]
+    [TestCase(-1f, true, 2)]
+    [TestCase(Consts.ClassifierSpamScoreThreshold, true, 1)]
+    [TestCase(0f, false, 1)]
+    public async Task HighConfidenceLlmSpam_ManualDatasetReview_PreservesExistingGates(float score, bool enabled, int expectedReports)
+    {
+        await using var fixture = await Fixture.Create(score, 0.99, true, "not_spam", lowConfidenceHamForward: enabled);
+
+        var result = await fixture.Check(PaidChat);
+        if (score is > -0.5f and < 0.5f)
+            await fixture.ReviewCompleted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(result, Is.EqualTo(CheckResult.NoMoreAction));
+            Assert.That(await fixture.Records(), Is.Empty);
+            Assert.That(fixture.Requests.Count(x => x.Method == "sendMessage"), Is.EqualTo(expectedReports));
+        }
+    }
+
+    [TestCase(0.01, true, "spam")]
+    [TestCase(0.3, true, "not_spam")]
+    [TestCase(0.01, true, null)]
+    [TestCase(0, false, "not_spam")]
+    public async Task LowConfidenceHam_WithoutConsensus_StillRequestsManualDatasetReview(
+        double lunaProbability,
+        bool lunaAvailable,
+        string? jevLabel
+    )
+    {
+        await using var fixture = await Fixture.Create(
+            -0.3917967f,
+            lunaProbability,
+            lunaAvailable,
+            jevLabel,
+            lowConfidenceHamForward: true
+        );
+
+        var result = await fixture.Check(PaidChat);
+        await fixture.ReviewCompleted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(result, Is.EqualTo(CheckResult.Pass));
+            Assert.That(await fixture.Records(), Is.Empty);
+            Assert.That(fixture.Requests.Count(x => x.Method == "forwardMessage"), Is.EqualTo(1));
+            Assert.That(RequestText(fixture.Requests.Single(x => x.Method == "sendMessage")), Does.Contain("конфиденс низкий"));
+        }
+    }
+
+    [Test]
+    public async Task LowConfidenceHam_LunaReportsSpam_DoesNotRequestHamDatasetReview()
+    {
+        await using var fixture = await Fixture.Create(-0.3917967f, 0.75, true, "not_spam", lowConfidenceHamForward: true);
+
+        var result = await fixture.Check(PaidChat);
+        await fixture.ReviewCompleted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(result, Is.EqualTo(CheckResult.Suspicious));
+            Assert.That(await fixture.Records(), Is.Empty);
+            Assert.That(RequestText(fixture.Requests.Single(x => x.Method == "sendMessage")), Does.Not.Contain("конфиденс низкий"));
+        }
+    }
+
+    [Test]
+    public async Task LowConfidenceHam_ModelsDisabled_StillRequestsManualDatasetReview()
+    {
+        await using var fixture = await Fixture.Create(-0.3917967f, 0.01, true, lowConfidenceHamForward: true, modelsEnabled: false);
+
+        var result = await fixture.Check(PaidChat);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(result, Is.EqualTo(CheckResult.Pass));
+            Assert.That(await fixture.Records(), Is.Empty);
+            Assert.That(fixture.LlmRequests, Is.Empty);
+            Assert.That(fixture.JevRequests, Is.Empty);
+            Assert.That(fixture.Requests.Count(x => x.Method == "forwardMessage"), Is.EqualTo(1));
+            Assert.That(RequestText(fixture.Requests.Single(x => x.Method == "sendMessage")), Does.Contain("конфиденс низкий"));
+        }
+    }
+
     [TestCase(-0.5f)]
     [TestCase(0.5f)]
     [TestCase(-1f)]
@@ -184,9 +475,9 @@ public sealed class MessageProcessorMlOverrideTests
         }
     }
 
-    [TestCase(0.799999, "spam", 0.9)]
-    [TestCase(0.200001, "not_spam", 0.9)]
-    [TestCase(0.9, "spam", 0.799999)]
+    [TestCase(0.899999, "spam", 0.9)]
+    [TestCase(0.100001, "not_spam", 0.9)]
+    [TestCase(0.9, "spam", 0.899999)]
     [TestCase(0.9, "not_spam", 0.9)]
     [TestCase(0.1, "spam", 0.9)]
     [TestCase(0.0, null, 0.9)]
@@ -232,7 +523,7 @@ public sealed class MessageProcessorMlOverrideTests
     [TestCase(FreeChat)]
     public async Task ApprovedUser_AmbiguousMlStillLearnsInEveryChat(long chatId)
     {
-        await using var fixture = await Fixture.Create(0, 0.2, true, "not_spam");
+        await using var fixture = await Fixture.Create(0, 0.1, true, "not_spam");
 
         await fixture.CheckApproved(chatId);
         await fixture.ReviewCompleted.Task.WaitAsync(TimeSpan.FromSeconds(10));
@@ -245,6 +536,106 @@ public sealed class MessageProcessorMlOverrideTests
             );
             Assert.That(fixture.LlmRequests, Has.Count.EqualTo(1));
             Assert.That(fixture.JevRequests, Has.Count.EqualTo(1));
+            Assert.That(fixture.Requests.Select(x => x.Method), Does.Not.Contain("deleteMessage"));
+        }
+    }
+
+    [TestCase(0.01, "not_spam", false)]
+    [TestCase(0.99, "spam", true)]
+    public async Task ApprovedUser_ConfidentAgreement_DoesNotRequestManualHamReview(
+        double lunaProbability,
+        string jevLabel,
+        bool expectedSpam
+    )
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var fixture = await Fixture.Create(
+            0.13794184f,
+            lunaProbability,
+            true,
+            jevLabel,
+            modelRelease: release.Task,
+            predictedSpam: true
+        );
+
+        try
+        {
+            await fixture.CheckApproved(PaidChat).WaitAsync(TimeSpan.FromSeconds(5));
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(fixture.ReviewCompleted.Task.IsCompleted, Is.False);
+                Assert.That(fixture.Requests.Where(x => x.Method is "forwardMessage" or "sendMessage" or "deleteMessage"), Is.Empty);
+            }
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+        await fixture.ReviewCompleted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That((await fixture.Records()).Single().IsSpam, Is.EqualTo(expectedSpam));
+            Assert.That(fixture.Requests.Count(x => x.Method == "forwardMessage"), Is.EqualTo(1));
+            Assert.That(fixture.Requests.Count(x => x.Method == "sendMessage"), Is.EqualTo(1));
+            Assert.That(
+                RequestText(fixture.Requests.Single(x => x.Method == "sendMessage")),
+                Does.Not.Contain("Возможно стоит добавить в ham")
+            );
+            Assert.That(fixture.Requests.Select(x => x.Method), Does.Not.Contain("deleteMessage"));
+        }
+    }
+
+    [TestCase(PaidChat, true, true, "spam", true)]
+    [TestCase(PaidChat, true, true, null, true)]
+    [TestCase(PaidChat, true, false, "not_spam", true)]
+    [TestCase(FreeChat, true, true, "spam", false)]
+    [TestCase(PaidChat, false, true, "spam", false)]
+    public async Task ApprovedUser_WithoutConsensus_PreservesManualHamReviewGates(
+        long chatId,
+        bool predictedSpam,
+        bool lunaAvailable,
+        string? jevLabel,
+        bool expectedReport
+    )
+    {
+        await using var fixture = await Fixture.Create(0.13794184f, 0.01, lunaAvailable, jevLabel, predictedSpam: predictedSpam);
+
+        await fixture.CheckApproved(chatId);
+        await fixture.ReviewCompleted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(await fixture.Records(), Is.Empty);
+            Assert.That(fixture.Requests.Count(x => x.Method == "sendMessage"), Is.EqualTo(expectedReport ? 1 : 0));
+            Assert.That(fixture.Requests.Count(x => x.Method == "forwardMessage"), Is.EqualTo(expectedReport ? 1 : 0));
+            Assert.That(fixture.Requests.Select(x => x.Method), Does.Not.Contain("deleteMessage"));
+            if (expectedReport)
+                Assert.That(
+                    RequestText(fixture.Requests.Single(x => x.Method == "sendMessage")),
+                    Does.Contain("Возможно стоит добавить в ham")
+                );
+        }
+    }
+
+    [TestCase(0.5f, true)]
+    [TestCase(0.13794184f, false)]
+    public async Task ApprovedUser_WithoutDatasetReview_StillRequestsManualHamReview(float score, bool modelsEnabled)
+    {
+        await using var fixture = await Fixture.Create(score, 0.01, true, "not_spam", modelsEnabled: modelsEnabled, predictedSpam: true);
+
+        await fixture.CheckApproved(PaidChat);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(fixture.LlmRequests, Is.Empty);
+            Assert.That(fixture.JevRequests, Is.Empty);
+            Assert.That(await fixture.Records(), Is.Empty);
+            Assert.That(fixture.Requests.Count(x => x.Method == "forwardMessage"), Is.EqualTo(1));
+            Assert.That(
+                RequestText(fixture.Requests.Single(x => x.Method == "sendMessage")),
+                Does.Contain("Возможно стоит добавить в ham")
+            );
             Assert.That(fixture.Requests.Select(x => x.Method), Does.Not.Contain("deleteMessage"));
         }
     }
@@ -331,6 +722,12 @@ public sealed class MessageProcessorMlOverrideTests
         return body.RootElement.GetProperty("chat_id").GetInt64();
     }
 
+    private static string? RequestText((string Method, string Body) request)
+    {
+        using var body = JsonDocument.Parse(request.Body);
+        return body.RootElement.GetProperty("text").GetString();
+    }
+
     private static void AssertDeleted(Fixture fixture, CheckResult result)
     {
         using (Assert.EnterMultipleScope())
@@ -401,10 +798,15 @@ public sealed class MessageProcessorMlOverrideTests
             double llmProbability,
             bool llmAvailable,
             string? jevLabel = null,
-            double jevConfidence = 0.8,
+            double jevConfidence = 0.9,
             Task? modelRelease = null,
             Task? jevRelease = null,
-            string? lunaContent = null
+            string? lunaContent = null,
+            bool lowConfidenceHamForward = false,
+            bool modelsEnabled = true,
+            bool failForwardAfterDeletion = false,
+            bool? predictedSpam = null,
+            string? forwardError = null
         )
         {
             var values = new Dictionary<string, string?>
@@ -412,14 +814,14 @@ public sealed class MessageProcessorMlOverrideTests
                 ["DOORMAN_BOT_API"] = "123456:TEST_TOKEN",
                 ["DOORMAN_ADMIN_CHAT"] = AdminChat.ToString(),
                 ["DOORMAN_ADMIN_CHAT_MAP"] = $"{PaidChat}={AdminChat}",
-                ["DOORMAN_OPENROUTER_API"] = "sk-test",
+                ["DOORMAN_OPENROUTER_API"] = modelsEnabled ? "sk-test" : null,
                 ["DOORMAN_FREE_LLM_URL"] = null,
                 ["DOORMAN_FREE_LLM_MODEL"] = null,
                 ["DOORMAN_FREE_LLM_API"] = null,
                 ["DOORMAN_CLUB_SERVICE_TOKEN"] = null,
                 ["DOORMAN_HIGH_CONFIDENCE_AUTOBAN_DISABLE"] = null,
                 ["DOORMAN_CHANNEL_MARKETOLOGY_EXCLUSION"] = null,
-                ["DOORMAN_LOW_CONFIDENCE_HAM_ENABLE"] = null,
+                ["DOORMAN_LOW_CONFIDENCE_HAM_ENABLE"] = lowConfidenceHamForward ? "true" : null,
                 ["DOORMAN_APPROVED_ML_SPAM_CHECK_DISABLE"] = null,
             };
             var previousEnvironment = values.Keys.ToDictionary(key => key, Environment.GetEnvironmentVariable);
@@ -439,6 +841,21 @@ public sealed class MessageProcessorMlOverrideTests
                         var method = request.RequestUri!.Segments.Last();
                         var body = request.Content == null ? "" : await request.Content.ReadAsStringAsync(ct);
                         requests.Enqueue((method, body));
+                        if (failForwardAfterDeletion && method == "forwardMessage" && requests.Any(x => x.Method == "deleteMessage"))
+                            forwardError ??= "Bad Request: message to forward not found";
+                        if (forwardError != null && method == "forwardMessage")
+                        {
+                            var response = JsonResponse(
+                                new
+                                {
+                                    ok = false,
+                                    error_code = 400,
+                                    description = forwardError,
+                                }
+                            );
+                            response.StatusCode = HttpStatusCode.BadRequest;
+                            return response;
+                        }
                         return TelegramResponse(method);
                     }
                 )
@@ -553,11 +970,10 @@ public sealed class MessageProcessorMlOverrideTests
             var serviceProvider = services.BuildServiceProvider();
             using (var scope = serviceProvider.CreateScope())
                 await scope.ServiceProvider.GetRequiredService<AppDbContext>().Database.EnsureCreatedAsync();
-            var config = serviceProvider.GetRequiredService<Config>();
-            for (var attempt = 0; config.MultiAdminChatMap.Count == 0 && attempt < 100; attempt++)
-                await Task.Delay(10);
-            if (config.MultiAdminChatMap.Count == 0)
-                throw new InvalidOperationException("test admin chat map did not initialize");
+            // Config resolves chat titles during initialization; keep the fixture independent of Telegram.
+            var cache = serviceProvider.GetRequiredService<HybridCache>();
+            await cache.SetAsync($"full_chan:{PaidChat}", new Config.ChatInfo(PaidChat, "Paid"));
+            await cache.SetAsync($"full_chan:{AdminChat}", new Config.ChatInfo(AdminChat, "Admin"));
 
             var result = new Fixture(
                 previousEnvironment,
@@ -573,14 +989,14 @@ public sealed class MessageProcessorMlOverrideTests
                 jevHttp,
                 score
             );
-            result.InstallClassifierScore(serviceProvider.GetRequiredService<SpamHamClassifier>());
+            result.InstallClassifierScore(serviceProvider.GetRequiredService<SpamHamClassifier>(), predictedSpam);
             return result;
         }
 
         public async Task<CheckResult> Check(long chatId, string? replyText = null)
         {
             var processor = _services.GetRequiredService<MessageProcessor>();
-            _reviewStarted = _score is > -0.5f and < 0.5f;
+            _reviewStarted = _score is > -0.5f and < 0.5f && _services.GetRequiredService<JevChecks>().Enabled;
             var message = new Message
             {
                 Id = 123,
@@ -602,6 +1018,31 @@ public sealed class MessageProcessorMlOverrideTests
                         [message, _user, message.Text!, message.Text!, message.Text!, message.Chat, CancellationToken.None]
                     )!;
             return await result;
+        }
+
+        public async Task CheckTextUpdate(long chatId, string text)
+        {
+            await _services.GetRequiredService<HybridCache>().SetAsync($"user:banned:{_user.Id}", false);
+            await _services
+                .GetRequiredService<MessageProcessor>()
+                .HandleUpdate(
+                    new Update
+                    {
+                        Message = new Message
+                        {
+                            Id = 127,
+                            From = _user,
+                            Chat = new Chat
+                            {
+                                Id = chatId,
+                                Title = chatId == PaidChat ? "Paid" : "Free",
+                                Type = ChatType.Supergroup,
+                            },
+                            Text = text,
+                        },
+                    },
+                    CancellationToken.None
+                );
         }
 
         public async Task CheckPoll(bool edited)
@@ -631,7 +1072,7 @@ public sealed class MessageProcessorMlOverrideTests
         public async Task CheckApproved(long chatId)
         {
             await _services.GetRequiredService<UserManager>().Approve(_user.Id);
-            _reviewStarted = _score is > -0.5f and < 0.5f;
+            _reviewStarted = _score is > -0.5f and < 0.5f && _services.GetRequiredService<JevChecks>().Enabled;
             await _services
                 .GetRequiredService<MessageProcessor>()
                 .HandleUpdate(
@@ -671,7 +1112,7 @@ public sealed class MessageProcessorMlOverrideTests
             return (await _services.GetRequiredService<AiChecks>().GetSpamProbability(message)).IsAvailable;
         }
 
-        private void InstallClassifierScore(SpamHamClassifier classifier)
+        private void InstallClassifierScore(SpamHamClassifier classifier, bool? predictedSpam)
         {
             var ml = new MLContext(seed: 1);
             var data = ml.Data.LoadFromEnumerable(new[] { new MessageData { Text = "smoke" } });
@@ -680,7 +1121,7 @@ public sealed class MessageProcessorMlOverrideTests
                     (_, output) =>
                     {
                         output.Score = _score;
-                        output.PredictedLabel = _score > Consts.ClassifierSpamScoreThreshold;
+                        output.PredictedLabel = predictedSpam ?? _score > Consts.ClassifierSpamScoreThreshold;
                     },
                     contractName: null
                 )
