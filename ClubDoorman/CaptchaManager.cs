@@ -5,6 +5,8 @@ using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.ReplyMarkups;
+using System.Net;
+using Telegram.Bot.Types.Enums;
 
 namespace ClubDoorman;
 
@@ -114,15 +116,21 @@ internal partial class CaptchaManager
         }
         else
         {
-        await _bot.SendMessage(
+    var name = WebUtility.HtmlEncode(Utils.FullName(cb.From));
+
+    await _bot.SendMessage(
         chat.Id,
-        $@"Добро пожаловать, {Utils.FullName(cb.From)}! У нас есть расписание пробежек в закрепах. Если его там пока нет, можно поискать по слову расписание в чате, чтобы понять концепцию. 
-        Чтобы присоединиться, можно просто придти на пробежку.  Если думаешь, что ты слишком медленный/быстрый, напиши в чат, на какую пробежку ты хочешь придти и свой темп",
+        $@"Добро пожаловать, <a href=""tg://user?id={cb.From.Id}"">{name}</a>!
+<b>Капча пройдена!</b>
+У нас есть расписание мероприятий в закрепах. Если его там пока нет, можно поискать по слову <i>таймтебл</i> в чате, чтобы понять принцип и примерные пробежки. 
+Чтобы присоединиться, можно просто придти в указанную локацию к нужному времени. Если думаешь, что ты слишком медленный/быстрый, напиши в чат, на какую пробежку ты хочешь придти и свой темп. Как правило, свои вещи можно оставить в точке старта/финиша, проверяй трек(!).
+Также в чате бот NakarteGpxBot, который превращает ссылку с nakarte в gpx автоматически.",
+        parseMode: ParseMode.Html,
         ephemeralMessageParameters: new EphemeralMessageParameters
         {
             ReceiverUserId = cb.From.Id
         }
-            );
+    );
         }
     }
 
