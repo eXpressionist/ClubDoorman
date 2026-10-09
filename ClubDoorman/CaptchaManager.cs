@@ -112,6 +112,18 @@ internal partial class CaptchaManager
             await _bot.BanChatMember(chat, answer.UserId, DateTime.UtcNow + TimeSpan.FromMinutes(5), revokeMessages: false);
             UnbanUserLater(chat, answer.UserId);
         }
+        else
+        {
+        await _bot.SendMessage(
+        chat.Id,
+        $@"Добро пожаловать, {Utils.FullName(cb.From)}! У нас есть расписание пробежек в закрепах. Если его там пока нет, можно поискать по слову расписание в чате, чтобы понять концепцию. 
+        Чтобы присоединиться, можно просто придти на пробежку.  Если думаешь, что ты слишком медленный/быстрый, напиши в чат, на какую пробежку ты хочешь придти и свой темп",
+        ephemeralMessageParameters: new EphemeralMessageParameters
+        {
+            ReceiverUserId = cb.From.Id
+        }
+            );
+        }
     }
 
     public async ValueTask IntroFlow(User user, Chat chat)
