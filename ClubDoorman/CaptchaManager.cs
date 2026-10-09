@@ -122,9 +122,10 @@ internal partial class CaptchaManager
         chat.Id,
         $@"Добро пожаловать, <a href=""tg://user?id={cb.From.Id}"">{name}</a>!
 <b>Капча пройдена!</b>
-У нас есть расписание мероприятий в закрепах. Если его там пока нет, можно поискать по слову <i>таймтебл</i> в чате, чтобы понять принцип и примерные пробежки. 
-Чтобы присоединиться, можно просто придти в указанную локацию к нужному времени. Если думаешь, что ты слишком медленный/быстрый, напиши в чат, на какую пробежку ты хочешь придти и свой темп. Как правило, свои вещи можно оставить в точке старта/финиша, проверяй трек(!).
-Также в чате бот NakarteGpxBot, который превращает ссылку с nakarte в gpx автоматически.",
+• <b>Расписание пробежек:</b> ищи в закрепе, если не готово - через поиск по слову <i>таймтейбл</i> можно примерно понять.
+• <b>Как присоединиться:</b> приходи к точке старта к нужному времени. Переживаешь за темп? Напиши в чат, на какую пробежку хочешь — найдём компанию.
+• <b>Вещи:</b> обычно можно оставить на старте (проверяй трек! если совпадает с финишем)
+• <b>Трек:</b> @NakarteGpxBot автоматически переводит ссылки с nakarte в GPX.",
         parseMode: ParseMode.Html,
         ephemeralMessageParameters: new EphemeralMessageParameters
         {
@@ -173,7 +174,8 @@ internal partial class CaptchaManager
             // The captcha is ephemeral: only the newcomer sees it, so no need to sanitize their name for the chat
             var sent = await _bot.SendMessage(
                 chatId,
-                $"Привет, {Utils.FullName(user)}! Антиспам: на какой кнопке {Captcha.CaptchaList[correctAnswer].Description}? (Push a button with correct emoji or be kicked)",
+                $@"Привет, {Utils.FullName(user)}! Антиспам: на какой кнопке {Captcha.CaptchaList[correctAnswer].Description}? 
+(Push a button with correct emoji or be kicked for some time)",
                 replyMarkup: keyboard,
                 ephemeralMessageParameters: new EphemeralMessageParameters { ReceiverUserId = user.Id }
             );
