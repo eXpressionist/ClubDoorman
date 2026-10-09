@@ -11,7 +11,7 @@ public class CaptchaManagerCallbackTests
         var (correctAnswer, keyboard) = CaptchaManager.BuildChallenge(userId, challengedMessageId);
 
         var buttons = keyboard.InlineKeyboard.SelectMany(row => row).ToList();
-        Assert.That(buttons, Has.Count.EqualTo(8));
+        Assert.That(buttons, Has.Count.EqualTo(6));
 
         var answers = buttons.Select(b => CaptchaManager.ParseCaptchaCallback(b.CallbackData!)).ToList();
         using (Assert.EnterMultipleScope())

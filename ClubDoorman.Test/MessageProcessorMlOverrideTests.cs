@@ -1041,7 +1041,16 @@ public sealed class MessageProcessorMlOverrideTests
                 (Task<CheckResult>)
                     method.Invoke(
                         processor,
-                        [message, _user, message.Text!, message.Text!, message.Text!, message.Chat, CancellationToken.None]
+                        [
+                            message,
+                            _user,
+                            message.Text!,
+                            message.Text!,
+                            message.Text!,
+                            message.Chat,
+                            _services.GetRequiredService<Config>().GetAdminChat(chatId),
+                            CancellationToken.None,
+                        ]
                     )!;
             return await result;
         }
@@ -1158,16 +1167,22 @@ public sealed class MessageProcessorMlOverrideTests
 
         public async ValueTask DisposeAsync()
         {
-            if (_reviewStarted)
-                await ReviewCompleted.Task.WaitAsync(TimeSpan.FromSeconds(10));
-            _services.Dispose();
-            _api.Dispose();
-            _llmHttp.Dispose();
-            _jevHttp.Dispose();
-            _telegramHttp.Dispose();
-            _db.Dispose();
-            foreach (var (key, value) in _previousEnvironment)
-                Environment.SetEnvironmentVariable(key, value);
+            try
+            {
+                if (_reviewStarted)
+                    await ReviewCompleted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            }
+            finally
+            {
+                _services.Dispose();
+                _api.Dispose();
+                _llmHttp.Dispose();
+                _jevHttp.Dispose();
+                _telegramHttp.Dispose();
+                _db.Dispose();
+                foreach (var (key, value) in _previousEnvironment)
+                    Environment.SetEnvironmentVariable(key, value);
+            }
         }
 
         private sealed class FixedPrediction
