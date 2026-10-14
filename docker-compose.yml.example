@@ -1,6 +1,6 @@
 services:
   doorman:
-    image: ghcr.io/expressionist/clubdoorman:latest
+    image: ghcr.io/expressionist/clubdoorman:side
     container_name: doorman
     environment:
       - TZ=Europe/Moscow
