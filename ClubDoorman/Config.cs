@@ -149,6 +149,9 @@ internal class Config
     public string? ClubServiceToken { get; } = Environment.GetEnvironmentVariable("DOORMAN_CLUB_SERVICE_TOKEN");
     public string ClubUrl { get; } = GetClubUrlOrDefault();
 
+    public long? WelcomeChatId { get; } =
+        long.TryParse(Environment.GetEnvironmentVariable("DOORMAN_WELCOME_CHAT_ID"), out var chatId) ? chatId : null;
+
     private static bool GetEnvironmentBool(string envName)
     {
         var env = Environment.GetEnvironmentVariable(envName);
