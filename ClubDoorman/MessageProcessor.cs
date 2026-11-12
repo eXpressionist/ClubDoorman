@@ -33,7 +33,8 @@ internal sealed record AdminForwardFallbackMessage(
 internal class MessageProcessor
 {
     private static readonly TimeSpan EmojiOnlyCheckWait = TimeSpan.FromSeconds(30);
-    private const string EmojiOnlyCheckPrompt = "Антиспам, у вас одни эмоджи в сообщении. Докажите что вы не бот. |Only emoji. Prove you're not a bot!|";
+    private const string EmojiOnlyCheckPrompt =
+        "Антиспам, у вас одни эмоджи в сообщении. Докажите что вы не бот. |Only emoji. Prove you're not a bot!|";
     private const string EmojiOnlyTimeoutReason = "В сообщении только эмоджи, пользователь не подтвердил что он не бот";
 
     private static readonly TimeSpan[] NewcomerBanlistCheckAfterJoin =
@@ -1181,7 +1182,7 @@ internal class MessageProcessor
         var fullName = Utils.FullName(user);
         var chat = message.Chat;
         _logger.LogDebug("Autoban. Chat: {Chat} {Id} User: {User}", chat.Title, chat.Id, fullName);
-	var admChat = _config.GetAdminChat(chat.Id);
+        var admChat = _config.GetAdminChat(chat.Id);
         if (_config.NonFreeChat(chat.Id))
         {
             var forward = await _bot.ForwardMessage(admChat, chat.Id, message.MessageId, cancellationToken: stoppingToken);

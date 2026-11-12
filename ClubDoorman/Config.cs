@@ -24,7 +24,7 @@ internal class Config
         CaptchaDisabledChats = GetChatsFromEnv("DOORMAN_CAPTCHA_DISABLE");
         FreeLlmDisabledChats = GetChatsFromEnv("DOORMAN_FREE_LLM_DISABLE");
         IgnoreReportChannels = GetChatsFromEnv("DOORMAN_CHANNELS_IGNORE_REPORT");
-	StatisticsFallbackAdminChats = GetChatsFromEnv("DOORMAN_STATISTICS_FALLBACK_ADMIN_CHATS");
+        StatisticsFallbackAdminChats = GetChatsFromEnv("DOORMAN_STATISTICS_FALLBACK_ADMIN_CHATS");
     }
 
     public bool BlacklistAutoBan { get; } = !GetEnvironmentBool("DOORMAN_BLACKLIST_AUTOBAN_DISABLE");
