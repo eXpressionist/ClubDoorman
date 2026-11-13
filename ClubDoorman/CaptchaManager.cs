@@ -135,10 +135,16 @@ internal partial class CaptchaManager
             return;
 
         if (_config.CaptchaDisabledChats.Contains(chatId))
+        {
+            _logger.LogDebug("Captcha skipped: disabled in chat {ChatId}, user {UserId}", chatId, user.Id);
             return;
+        }
 
-        if (await IsDiscussionChatAsync(chatId) == true)
+        if (!_config.CaptchaDiscussionEnabledChats.Contains(chatId) && await IsDiscussionChatAsync(chatId) == true)
+        {
+            _logger.LogDebug("Captcha skipped: chat {ChatId} is linked to a channel, user {UserId}", chatId, user.Id);
             return;
+        }
 
         var key = UserToKey(chatId, user);
 
@@ -162,6 +168,7 @@ internal partial class CaptchaManager
                 replyMarkup: keyboard,
                 ephemeralMessageParameters: new EphemeralMessageParameters { ReceiverUserId = user.Id }
             );
+            _logger.LogInformation("Join captcha sent. Chat {ChatId}, user {UserId}", chatId, user.Id);
             _bot.DeleteMessageLater(sent, TimeSpan.FromSeconds(45), _logger, captchaInfo.Cts.Token)
                 .FireAndForget(_logger, nameof(Utils.DeleteMessageLater));
         }

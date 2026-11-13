@@ -3,6 +3,7 @@ services:
     image: ghcr.io/expressionist/clubdoorman:side
     environment:
       - DOORMAN_CHANNELS_IGNORE_REPORT=${DOORMAN_CHANNELS_IGNORE_REPORT:-}
+      - DOORMAN_CAPTCHA_DISCUSSION_ENABLE=${DOORMAN_CAPTCHA_DISCUSSION_ENABLE:-}
       - DOORMAN_WELCOME_CHAT_ID=${DOORMAN_WELCOME_CHAT_ID:-}
     volumes:
       - /home/ClubDoorman/data:/app/data

@@ -26,6 +26,83 @@ public sealed class MessageProcessorMlOverrideTests
     private const long FreeChat = -1009876543210;
     private const long AdminChat = -1001111111111;
 
+    [TestCase(false, null, false, true)]
+    [TestCase(false, null, true, false)]
+    [TestCase(true, null, false, false)]
+    [TestCase(true, "", false, false)]
+    [TestCase(true, "-1001234567890", false, true)]
+    [TestCase(true, "-1009876543210, -1001234567890", false, true)]
+    [TestCase(true, "-1009876543210", false, false)]
+    [TestCase(true, "-1001234567890", true, false)]
+    public async Task JoinUpdate_RespectsDiscussionCaptchaSettings(
+        bool isDiscussionChat,
+        string? enabledChats,
+        bool captchaDisabled,
+        bool expectedCaptcha
+    )
+    {
+        await using var fixture = await Fixture.Create(
+            score: -1f,
+            llmProbability: 0.0,
+            llmAvailable: false,
+            captchaDiscussionEnabledChats: enabledChats,
+            captchaDisabledChats: captchaDisabled ? PaidChat.ToString() : null,
+            linkedChatId: isDiscussionChat ? -1002222222222 : null
+        );
+
+        await fixture.Join(PaidChat);
+
+        var messages = fixture.Requests.Where(x => x.Method == "sendMessage").ToArray();
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(messages, Has.Length.EqualTo(expectedCaptcha ? 1 : 0));
+            Assert.That(fixture.IsCaptchaNeeded(PaidChat), Is.EqualTo(expectedCaptcha));
+        }
+        if (!expectedCaptcha)
+            return;
+
+        using var request = JsonDocument.Parse(messages.Single().Body);
+        var body = request.RootElement;
+        var text = body.GetProperty("text").GetString()!;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(body.GetProperty("chat_id").GetInt64(), Is.EqualTo(PaidChat));
+            Assert.That(body.GetProperty("ephemeral_message_parameters").GetProperty("receiver_user_id").GetInt64(), Is.EqualTo(42));
+            Assert.That(text, Does.Contain("Антиспам"));
+        }
+
+        var correctAnswer = Captcha.CaptchaList.FindIndex(x => text.Contains(x.Description, StringComparison.Ordinal));
+        var callbackData = body.GetProperty("reply_markup")
+            .GetProperty("inline_keyboard")
+            .EnumerateArray()
+            .SelectMany(row => row.EnumerateArray())
+            .Select(button => button.GetProperty("callback_data").GetString()!)
+            .Single(data => CaptchaManager.ParseCaptchaCallback(data)?.Chosen == correctAnswer);
+        await fixture.AnswerCaptcha(PaidChat, callbackData);
+
+        Assert.That(fixture.IsCaptchaNeeded(PaidChat), Is.False);
+    }
+
+    [Test]
+    public async Task JoinUpdate_ApprovedUserSkipsCaptchaEvenWhenEnabledForDiscussionChat()
+    {
+        await using var fixture = await Fixture.Create(
+            score: -1f,
+            llmProbability: 0.0,
+            llmAvailable: false,
+            captchaDiscussionEnabledChats: PaidChat.ToString(),
+            linkedChatId: -1002222222222
+        );
+
+        await fixture.Join(PaidChat, approved: true);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(fixture.Requests.Where(x => x.Method == "sendMessage"), Is.Empty);
+            Assert.That(fixture.IsCaptchaNeeded(PaidChat), Is.False);
+        }
+    }
+
     [TestCase(PaidChat, "Hi")]
     [TestCase(FreeChat, "Hi")]
     [TestCase(PaidChat, "привет")]
@@ -829,7 +906,10 @@ public sealed class MessageProcessorMlOverrideTests
             bool modelsEnabled = true,
             bool failForwardAfterDeletion = false,
             bool? predictedSpam = null,
-            string? forwardError = null
+            string? forwardError = null,
+            string? captchaDiscussionEnabledChats = null,
+            string? captchaDisabledChats = null,
+            long? linkedChatId = null
         )
         {
             var values = new Dictionary<string, string?>
@@ -846,6 +926,9 @@ public sealed class MessageProcessorMlOverrideTests
                 ["DOORMAN_CHANNEL_MARKETOLOGY_EXCLUSION"] = null,
                 ["DOORMAN_LOW_CONFIDENCE_HAM_ENABLE"] = lowConfidenceHamForward ? "true" : null,
                 ["DOORMAN_APPROVED_ML_SPAM_CHECK_DISABLE"] = null,
+                ["DOORMAN_CAPTCHA_DISCUSSION_ENABLE"] = captchaDiscussionEnabledChats,
+                ["DOORMAN_CAPTCHA_DISABLE"] = captchaDisabledChats,
+                ["DOORMAN_WELCOME_CHAT_ID"] = null,
             };
             var previousEnvironment = values.Keys.ToDictionary(key => key, Environment.GetEnvironmentVariable);
             foreach (var (key, value) in values)
@@ -879,7 +962,7 @@ public sealed class MessageProcessorMlOverrideTests
                             response.StatusCode = HttpStatusCode.BadRequest;
                             return response;
                         }
-                        return TelegramResponse(method);
+                        return TelegramResponse(method, linkedChatId);
                     }
                 )
             );
@@ -1055,6 +1138,66 @@ public sealed class MessageProcessorMlOverrideTests
             return await result;
         }
 
+        public bool IsCaptchaNeeded(long chatId) => _services.GetRequiredService<CaptchaManager>().IsCaptchaNeeded(chatId, _user);
+
+        public async Task Join(long chatId, bool approved = false)
+        {
+            await _services.GetRequiredService<HybridCache>().SetAsync($"user:banned:{_user.Id}", false);
+            if (approved)
+                await _services.GetRequiredService<UserManager>().Approve(_user.Id);
+
+            using var stopping = new CancellationTokenSource();
+            try
+            {
+                await _services
+                    .GetRequiredService<MessageProcessor>()
+                    .HandleUpdate(
+                        new Update
+                        {
+                            ChatMember = new ChatMemberUpdated
+                            {
+                                Chat = new Chat
+                                {
+                                    Id = chatId,
+                                    Type = ChatType.Supergroup,
+                                    Title = "Joined chat",
+                                },
+                                From = _user,
+                                Date = DateTime.UtcNow,
+                                OldChatMember = new ChatMemberLeft { User = _user },
+                                NewChatMember = new ChatMemberMember { User = _user },
+                            },
+                        },
+                        stopping.Token
+                    );
+            }
+            finally
+            {
+                await stopping.CancelAsync();
+            }
+        }
+
+        public Task AnswerCaptcha(long chatId, string callbackData) =>
+            _services
+                .GetRequiredService<MessageProcessor>()
+                .HandleUpdate(
+                    new Update
+                    {
+                        CallbackQuery = new CallbackQuery
+                        {
+                            Id = "captcha-answer",
+                            From = _user,
+                            Data = callbackData,
+                            Message = new Message
+                            {
+                                Id = 124,
+                                Chat = new Chat { Id = chatId, Type = ChatType.Supergroup },
+                            },
+                        },
+                    },
+                    CancellationToken.None
+                );
+
         public async Task CheckTextUpdate(long chatId, string text)
         {
             await _services.GetRequiredService<HybridCache>().SetAsync($"user:banned:{_user.Id}", false);
@@ -1217,7 +1360,7 @@ public sealed class MessageProcessorMlOverrideTests
                 respond(request, cancellationToken);
         }
 
-        private static HttpResponseMessage TelegramResponse(string method) =>
+        private static HttpResponseMessage TelegramResponse(string method, long? linkedChatId) =>
             method switch
             {
                 "getMe" => JsonResponse(
@@ -1242,6 +1385,7 @@ public sealed class MessageProcessorMlOverrideTests
                             type = "supergroup",
                             title = "Paid",
                             description = "test chat",
+                            linked_chat_id = linkedChatId,
                         },
                     }
                 ),

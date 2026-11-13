@@ -22,6 +22,7 @@ internal class Config
         EmojiCheckDisabledChats = GetChatsFromEnv("DOORMAN_CHANNELS_EMOJI_DISABLE");
         MarketologsChats = GetChatsFromEnv("DOORMAN_CHANNEL_MARKETOLOGY_EXCLUSION");
         CaptchaDisabledChats = GetChatsFromEnv("DOORMAN_CAPTCHA_DISABLE");
+        CaptchaDiscussionEnabledChats = GetChatsFromEnv("DOORMAN_CAPTCHA_DISCUSSION_ENABLE");
         FreeLlmDisabledChats = GetChatsFromEnv("DOORMAN_FREE_LLM_DISABLE");
         IgnoreReportChannels = GetChatsFromEnv("DOORMAN_CHANNELS_IGNORE_REPORT");
         StatisticsFallbackAdminChats = GetChatsFromEnv("DOORMAN_STATISTICS_FALLBACK_ADMIN_CHATS");
@@ -54,6 +55,7 @@ internal class Config
     public FrozenSet<long> EmojiCheckDisabledChats { get; }
     public FrozenSet<long> MarketologsChats { get; }
     public FrozenSet<long> CaptchaDisabledChats { get; }
+    public FrozenSet<long> CaptchaDiscussionEnabledChats { get; }
     public FrozenSet<long> IgnoreReportChannels { get; }
     public FrozenSet<long> FreeLlmDisabledChats { get; }
     public FrozenSet<long> StatisticsFallbackAdminChats { get; }
